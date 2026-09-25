@@ -398,6 +398,7 @@ function formatSessions(sessions, paint) {
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
+  if (sessions.sticky) mode += ` ${paint.dim('·')} ${paint.green('sticky')}`;
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
 }
 

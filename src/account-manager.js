@@ -337,8 +337,9 @@ export class AccountManager {
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
+   * @param {boolean} [opts.stickySessions]
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, stickySessions = false } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -359,6 +360,18 @@ export class AccountManager {
     // header and the remote dashboard all ask only that question.
     this.distributionMode = distributionMode(distributeSessions);
     this.distributeSessions = this.distributionMode !== 'off';
+    // Sticky sessions (KAN-2393). With distribution on, a pinned conversation
+    // normally still MOVES when its account is preempted by priority (a manual
+    // switch rewrites priorities) or rolls over its window (expiry routing).
+    // Each move re-sends the whole context uncached on the other account. When
+    // sticky, a pin is released only when its account actually cannot serve:
+    // throttled/exhausted after a 429, upstream-rejected, disabled, capped, or
+    // a quota bucket at 100% (the switch threshold is ignored for a pin). New
+    // conversations still follow priority, expiry routing and adaptive scoring.
+    this.stickySessions = !!stickySessions;
+    // Set only for the duration of a synchronous hard-availability check
+    // (_stickyUsable): thresholdFor answers this instead of the configured value.
+    this._thresholdOverride = null;
     // Adaptive burn rate and tolerated concurrency are inferred from live
     // traffic. Plan size is authoritative OAuth profile metadata, not a learned
     // estimate. Learners are constructed unconditionally so enabling adaptive
@@ -491,6 +504,7 @@ export class AccountManager {
    * @param {any} [account]
    */
   thresholdFor(bucket, account = null) {
+    if (this._thresholdOverride != null) return this._thresholdOverride;
     return resolveSwitchThreshold(account?.switchThreshold, bucket, this._fleetThresholdFor(bucket));
   }
 
@@ -1081,6 +1095,13 @@ export class AccountManager {
     for (const idx of candidates) {
       const pinned = this.accounts[idx];
       if (!pinned) continue;
+      // Sticky: the pin holds until its account genuinely cannot serve. No
+      // rollover or priority preemption — those are reasons to place NEW
+      // conversations elsewhere, not to throw away a running one's cache.
+      if (this.stickySessions) {
+        if (!exclude?.has(idx) && this._stickyUsable(pinned, model, advisorModel)) return pinned;
+        continue;
+      }
       // Skipping writes nothing and destroys nothing, so a window that rolled
       // while this account was out of reach is still there to be found when
       // traffic returns to it.
@@ -1776,6 +1797,28 @@ export class AccountManager {
 
   _isAvailable(account, model = null, advisorModel = null) {
     return this.unavailableReason(account, model, advisorModel) === null;
+  }
+
+  /**
+   * Hard availability for a sticky pin (KAN-2393): the same verdict as
+   * _isAvailable, except that a quota bucket bars the account only at 100%
+   * rather than at the configured switch threshold. Throttled, exhausted,
+   * upstream-rejected, disabled, capped and route checks are unchanged, so a
+   * real 429 still releases the pin.
+   */
+  _stickyUsable(account, model = null, advisorModel = null) {
+    const prev = this._thresholdOverride;
+    this._thresholdOverride = 1;
+    try {
+      return this._isAvailable(account, model, advisorModel);
+    } finally {
+      this._thresholdOverride = prev;
+    }
+  }
+
+  /** Live toggle for sticky sessions (config reload). */
+  setStickySessions(enabled) {
+    this.stickySessions = !!enabled;
   }
 
   /**
@@ -4124,7 +4167,7 @@ export class AccountManager {
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
-      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount(), sticky: this.distributeSessions && this.stickySessions },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
