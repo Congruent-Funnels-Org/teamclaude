@@ -99,7 +99,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     const state = g.listening?.listening ? 'listening' : g.listen ? `not listening${g.listening?.error ? ' (' + g.listening.error + ')' : ''}` : 'off';
     lines.push(`${paint.bold('Guests')} ${paint.dim(`${where}, ${state}`)}`);
     for (const k of guestKeys) {
-      const cap = k.dailyTokenCap ? `/${Number(k.dailyTokenCap).toLocaleString('en-US')}` : '';
+      const cap = k.dailyTokenCap === 'unlimited' ? '/unlimited' : k.dailyTokenCap ? `/${Number(k.dailyTokenCap).toLocaleString('en-US')}` : ' (no cap: refused)';
       const seen = k.lastSeen ? `last seen ${k.lastSeen}` : 'never seen';
       lines.push(`  ${safeLine(String(k.name))}  ${k.enabled ? 'enabled' : paint.dim('disabled')}  → ${safeLine(String(k.account || "?"))}  ${Number(k.tokensToday || 0).toLocaleString('en-US')}${cap} tokens today, ${k.requestsToday || 0} req  ${paint.dim(seen)}`);
     }

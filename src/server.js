@@ -973,10 +973,17 @@ export function clientSessionId(headers) {
  * @param {Object|null} [opts.egress]
  * @param {Object|null} [opts.clientUsage]
  * @param {string|null} [opts.forcedClient]
+ * @param {string|null} [opts.sessionPrefix]  prefixed to the client session id for routing and readouts
  * @param {Object|null} [opts.dimensionUsage]
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, sessionPrefix = null }) {
   let counter = 0;
+  // The routing/readout session id. A guest listener (guest.js) prefixes it so
+  // a caller-chosen id can never land on one of the operator's own sessions.
+  const sessionOf = (/** @type {any} */ headers) => {
+    const id = clientSessionId(headers);
+    return id && sessionPrefix ? `${sessionPrefix}${id}` : id;
+  };
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
@@ -990,7 +997,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // unknown-pin 404: an operator should see a client probing the boundary.
       if (hasDotSegment(req.url)) {
         const reqId = ++counter;
-        const sessionId = req.headers['x-claude-code-session-id'] || null;
+        const sessionId = sessionOf(req.headers);
         hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
@@ -1021,7 +1028,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
         if (clientGone(res)) return;
         if (!state.ok) {
-          recordEarlyOutcome(accountManager, { sessionId: clientSessionId(req.headers) }, req.url, false);
+          recordEarlyOutcome(accountManager, { sessionId: sessionOf(req.headers) }, req.url, false);
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
             type: 'error',
@@ -1066,7 +1073,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           // value on the path that can carry raw control bytes.
           const shown = safeLine(token ?? raw);
           const reqId = ++counter;
-          const sessionId = clientSessionId(req.headers);
+          const sessionId = sessionOf(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
@@ -1110,7 +1117,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
           const reqId = ++counter;
-          const sessionId = clientSessionId(req.headers);
+          const sessionId = sessionOf(req.headers);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
@@ -1123,7 +1130,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
-      const sessionId = clientSessionId(req.headers);
+      const sessionId = sessionOf(req.headers);
       if (!hideActivity) {
         // Marked open BEFORE the hook runs. The shipped TUI hook registers its
         // row and then renders, and the render can rethrow, so a hook that

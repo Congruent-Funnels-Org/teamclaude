@@ -10,18 +10,19 @@
 
 import { open } from 'node:fs/promises';
 import { atomicConfigUpdate, loadConfig } from './config.js';
-import { hashGuestKey, newGuestKey, isWildcardHost } from './guest.js';
+import { hashGuestKey, newGuestKey, guestHostProblem } from './guest.js';
 
 export const GUEST_USAGE = `Usage:
   teamclaude guest list [--json]
-  teamclaude guest add <name> --account <account> [--cap <tokens/day>] [--key-file <path>]
+  teamclaude guest add <name> --account <account> --cap <tokens/day|unlimited> [--key-file <path>]
   teamclaude guest rotate <name> [--key-file <path>]
   teamclaude guest enable <name> | disable <name> [--rotate]
-  teamclaude guest cap <name> <tokens/day|0>
+  teamclaude guest cap <name> <tokens/day|unlimited>
   teamclaude guest remove <name>
   teamclaude guest listen <host> <port> | listen off
 Guest keys reach ONE pinned account on a separate listener (config.guests).
-The daily cap is per UTC day, counting input + output + cache tokens.`;
+The daily cap is per UTC day, counting input + output + cache tokens. It is required:
+a key without one is refused by the listener.`;
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -49,11 +50,12 @@ function fail(msg) {
   process.exitCode = 1;
 }
 
-/** @param {unknown} v */
+/** @param {unknown} v @returns {number|'unlimited'} */
 function parseCap(v) {
-  if (v === undefined) return undefined;
+  if (v === undefined || v === true) throw new Error('A daily cap is required: --cap <tokens/day> (e.g. 3000000) or --cap unlimited.');
+  if (String(v) === 'unlimited') return 'unlimited';
   const n = Number(String(v).replace(/[_,]/g, ''));
-  if (!Number.isInteger(n) || n < 0) throw new Error(`Bad cap "${v}": a whole number of tokens per day (0 = no cap).`);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`Bad cap "${v}": a whole number of tokens per day above 0, or "unlimited".`);
   return n;
 }
 
@@ -145,7 +147,7 @@ export async function guestCommand(argv) {
         console.log(`Guest listener: ${listen ? `${listen.host}:${listen.port}` : 'off'}${listen ? state : ''}`);
         if (!rows.length) { console.log('No guest keys.'); return; }
         for (const r of rows) {
-          const cap = r.dailyTokenCap ? r.dailyTokenCap.toLocaleString('en-US') : 'no cap';
+          const cap = r.dailyTokenCap === 'unlimited' ? 'unlimited' : r.dailyTokenCap ? Number(r.dailyTokenCap).toLocaleString('en-US') : 'NO CAP (refused)';
           const today = r.tokensToday == null ? 'server not reachable' : `${r.tokensToday.toLocaleString('en-US')} tokens / ${r.requestsToday} req today`;
           console.log(`  ${r.name}  ${r.enabled ? 'enabled ' : 'DISABLED'}  → ${r.account}  cap ${cap}  ${today}  last seen ${r.lastSeen || 'never'}`);
         }
@@ -162,7 +164,7 @@ export async function guestCommand(argv) {
           if (findKey(c, name)) { exists = true; return; }
           c.guests ??= {};
           c.guests.keys ??= [];
-          c.guests.keys.push({ name, keyHash: hashGuestKey(key), account, dailyTokenCap: cap ?? 0, enabled: true });
+          c.guests.keys.push({ name, keyHash: hashGuestKey(key), account, dailyTokenCap: cap, enabled: true });
         });
         if (exists) return fail(`A guest key named "${name}" exists; use rotate.`);
         if (!(config.accounts || []).some((/** @type {any} */ a) => a?.name === account || a?.email === account)) {
@@ -200,7 +202,7 @@ export async function guestCommand(argv) {
         const cap = parseCap(pos[1]);
         const config = await updateKey(name, (/** @type {any} */ k) => { k.dailyTokenCap = cap; });
         if (!config) return;
-        console.log(`Guest "${name}" daily cap: ${cap ? cap.toLocaleString('en-US') + ' tokens' : 'none'}.`);
+        console.log(`Guest "${name}" daily cap: ${cap === 'unlimited' ? 'unlimited' : cap.toLocaleString('en-US') + ' tokens'}.`);
         await notifyRunningServer(config);
         return;
       }
@@ -227,7 +229,8 @@ export async function guestCommand(argv) {
         const [host, portStr] = pos;
         const port = Number(portStr);
         if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return fail(GUEST_USAGE);
-        if (isWildcardHost(host)) return fail(`Refusing "${host}": the guest listener binds ONE address (e.g. this machine's tailscale IP).`);
+        const problem = guestHostProblem(host);
+        if (problem) return fail(`Refusing "${host}": ${problem}. Use this machine's tailscale IP (tailscale ip -4).`);
         await atomicConfigUpdate((/** @type {any} */ c) => { c.guests ??= {}; c.guests.keys ??= []; c.guests.listen = { host, port }; });
         console.log(`Guest listener set to ${host}:${port} (takes effect on the next server restart).`);
         return;

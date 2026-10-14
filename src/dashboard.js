@@ -783,7 +783,7 @@ ${SHARED_HELPERS}
       tr.appendChild(el('td', '', k.account || '—'));
       tr.appendChild(el('td', '', k.enabled ? 'enabled' : 'disabled'));
       tr.appendChild(el('td', 'num', fmtNum(k.tokensToday || 0)));
-      tr.appendChild(el('td', 'num', k.dailyTokenCap ? fmtNum(k.dailyTokenCap) : '—'));
+      tr.appendChild(el('td', 'num', k.dailyTokenCap === 'unlimited' ? 'unlimited' : k.dailyTokenCap ? fmtNum(k.dailyTokenCap) : 'none (refused)'));
       tr.appendChild(el('td', 'num', fmtNum(k.requestsToday || 0)));
       tr.appendChild(el('td', 'num', k.lastSeen ? fmtAgo(k.lastSeen) : '—'));
       table.appendChild(tr);
