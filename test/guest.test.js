@@ -1,0 +1,405 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import net from 'node:net';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+import {
+  createGuestServer, startGuestListener, GuestUsageTracker, guestStatus,
+  hashGuestKey, newGuestKey, resolveGuestKey, presentedGuestKey,
+  isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight,
+} from '../src/guest.js';
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+function oauth(name) {
+  return { name, type: 'oauth', accessToken: 't-' + name, refreshToken: 'r', expiresAt: Date.now() + 3600_000 };
+}
+
+const KEY = 'tcg-test-key-0123456789';
+
+function guestsConfig(extra = {}) {
+  return { keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai', dailyTokenCap: 0, enabled: true, ...extra }] };
+}
+
+// ── units ────────────────────────────────────────────────────────────────────
+
+test('hashGuestKey is sha256 hex; newGuestKey is prefixed and random', () => {
+  assert.match(hashGuestKey('x'), /^[0-9a-f]{64}$/);
+  assert.equal(hashGuestKey('x'), '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881');
+  const a = newGuestKey(); const b = newGuestKey();
+  assert.ok(a.startsWith('tcg-') && a.length > 30);
+  assert.notEqual(a, b);
+});
+
+test('resolveGuestKey matches the hash, ignores disabled and malformed entries', () => {
+  const g = guestsConfig();
+  assert.equal(resolveGuestKey(g, KEY)?.name, 'nephew');
+  assert.equal(resolveGuestKey(g, KEY + 'x'), null);
+  assert.equal(resolveGuestKey(g, ''), null);
+  assert.equal(resolveGuestKey(g, null), null);
+  assert.equal(resolveGuestKey(guestsConfig({ enabled: false }), KEY), null);
+  assert.equal(resolveGuestKey(guestsConfig({ keyHash: 'nothex' }), KEY), null);
+  assert.equal(resolveGuestKey(guestsConfig({ account: '' }), KEY), null);
+  // A plaintext key in the hash slot is not a match for itself.
+  assert.equal(resolveGuestKey({ keys: [{ name: 'n', keyHash: KEY, account: 'ai' }] }, KEY), null);
+  assert.equal(resolveGuestKey(undefined, KEY), null);
+});
+
+test('presentedGuestKey reads x-api-key, then a Bearer token', () => {
+  assert.equal(presentedGuestKey({ 'x-api-key': 'a' }), 'a');
+  assert.equal(presentedGuestKey({ authorization: 'Bearer b' }), 'b');
+  assert.equal(presentedGuestKey({ authorization: 'Basic b' }), null);
+  assert.equal(presentedGuestKey({}), null);
+});
+
+test('only the inference routes are allowed, matched on the exact pathname', () => {
+  assert.ok(isAllowedGuestRoute('POST', '/v1/messages'));
+  assert.ok(isAllowedGuestRoute('POST', '/v1/messages?beta=true'));
+  assert.ok(isAllowedGuestRoute('POST', '/v1/messages/count_tokens?beta=true'));
+  assert.ok(isAllowedGuestRoute('GET', '/v1/models'));
+  assert.ok(isAllowedGuestRoute('GET', '/v1/models/claude-haiku-4-5'));
+  for (const [m, u] of [
+    ['GET', '/v1/messages'], ['POST', '/v1/models'], ['GET', '/teamclaude/status'],
+    ['POST', '/teamclaude/reload'], ['GET', '/teamclaude/dashboard'], ['POST', '/v1/oauth/token'],
+    ['POST', '/api/event_logging/batch'], ['GET', '/api/oauth/profile'], ['POST', '/tc-acct/jan/v1/messages'],
+    ['POST', '//v1/messages'], ['POST', '/v1/./messages'], ['POST', '/v1/messages/../models'],
+    ['POST', '/v1/messages/'], ['POST', '/V1/messages'], ['POST', 'http://x/v1/messages'],
+    ['POST', '/v1/responses'], ['GET', '/v1/models/../../teamclaude/status'], ['POST', '/mcp'],
+  ]) assert.equal(isAllowedGuestRoute(m, u), false, `${m} ${u}`);
+});
+
+test('wildcard hosts are refused', () => {
+  for (const h of ['0.0.0.0', '::', '', ' ', '*', undefined]) assert.ok(isWildcardHost(h), String(h));
+  assert.ok(!isWildcardHost('100.99.200.17'));
+});
+
+test('GuestUsageTracker resets "today" on a new UTC day and keeps lifetime totals', () => {
+  let now = Date.UTC(2026, 9, 14, 23, 59);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.recordRequest('n'); t.recordTokens('n', 100); t.recordTokens('n', -5); t.recordTokens('n', NaN);
+  assert.equal(t.tokensToday('n'), 100);
+  now = Date.UTC(2026, 9, 15, 0, 1);
+  assert.equal(t.tokensToday('n'), 0);
+  assert.deepEqual({ ...t.get('n'), lastSeen: null }, { requestsToday: 0, tokensToday: 0, requests: 1, tokens: 100, lastSeen: null });
+  const copy = new GuestUsageTracker({ now: () => now });
+  copy.restore(t.export());
+  assert.equal(copy.get('n').tokens, 100);
+  assert.equal(utcDay(Date.UTC(2026, 0, 2, 3)), '2026-01-02');
+  assert.equal(secondsToUtcMidnight(Date.UTC(2026, 0, 2, 23, 59, 0)), 60);
+});
+
+test('guestStatus shows counters and never a key or hash', () => {
+  const s = guestStatus({ guests: { listen: { host: 'h', port: 1 }, ...guestsConfig({ dailyTokenCap: 5 }) } }, new GuestUsageTracker());
+  assert.equal(s.keys[0].name, 'nephew');
+  assert.equal(s.keys[0].dailyTokenCap, 5);
+  assert.ok(!JSON.stringify(s).includes(hashGuestKey(KEY)));
+});
+
+// ── integration: a guest server in front of a mock upstream ─────────────────
+
+// The mock upstream answers per account (by the bearer it receives), so a test
+// can make the PINNED account fail and prove the other one is never asked.
+async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accounts = ['jan', 'ai'] } = {}) {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      const who = String(req.headers.authorization || '').replace('Bearer t-', '');
+      seen.push({ who, path: req.url, method: req.method, apiKey: req.headers['x-api-key'], cookie: req.headers.cookie, body });
+      const h = upstreamFor[who];
+      if (h) return h(req, res, body);
+      res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'sess=secret', 'x-ok': '1' });
+      res.end(JSON.stringify({ id: 'm', type: 'message', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 20 } }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  // No refresh token: a 401 must not send the test to the real OAuth endpoint.
+  const am = new AccountManager(accounts.map(n => ({ ...oauth(n), refreshToken: undefined })), 0.98);
+  const config = { proxy: { apiKey: 'main-key' }, upstream: `http://127.0.0.1:${upstreamPort}`, guests };
+  const guestUsage = new GuestUsageTracker();
+  const logs = [];
+  const guest = createGuestServer({ accountManager: am, config, guestUsage, log: m => logs.push(m) });
+  const port = await listen(guest);
+  try {
+    return await run({ port, seen, am, guestUsage, config, logs });
+  } finally {
+    guest.closeAllConnections?.();
+    guest.close();
+    upstream.closeAllConnections?.();
+    upstream.close();
+  }
+}
+
+const ask = (port, { key = KEY, path = '/v1/messages?beta=true', method = 'POST', headers = {} } = {}) => fetch(`http://127.0.0.1:${port}${path}`, {
+  method,
+  headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}), ...headers },
+  body: method === 'GET' ? undefined : JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+});
+
+test('a guest request is served by its pinned account with the account token, guest key stripped', async () => {
+  await withGuest(async ({ port, seen, guestUsage }) => {
+    const res = await ask(port, { headers: { cookie: 'c=1' } });
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.content[0].text, 'hi');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].who, 'ai');
+    assert.equal(seen[0].apiKey, undefined);
+    assert.equal(seen[0].cookie, undefined);
+    assert.ok(!seen[0].body.includes(KEY));
+    assert.equal(res.headers.get('set-cookie'), null);
+    assert.equal(res.headers.get('x-ok'), '1');
+    // input + output + cache read + cache write
+    assert.equal(guestUsage.tokensToday('nephew'), 135);
+    assert.equal(guestUsage.get('nephew').requestsToday, 1);
+  });
+});
+
+test('a Bearer guest key works too; GET /v1/models is forwarded on the pin', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const res = await ask(port, { key: null, path: '/v1/models', method: 'GET', headers: { authorization: `Bearer ${KEY}` } });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(seen[0].who, 'ai');
+    assert.equal(seen[0].path, '/v1/models');
+  });
+});
+
+test('a wrong or missing key is 401 and never reaches upstream', async () => {
+  await withGuest(async ({ port, seen }) => {
+    for (const key of ['nope', null, 'main-key']) {
+      const res = await ask(port, { key });
+      assert.equal(res.status, 401, String(key));
+      await res.text();
+    }
+    assert.equal(seen.length, 0);
+  });
+});
+
+test('a disabled key is 401', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const res = await ask(port);
+    assert.equal(res.status, 401);
+    assert.equal(seen.length, 0);
+  }, { guests: guestsConfig({ enabled: false }) });
+});
+
+test('everything off the allow-list is 404, even with a valid key', async () => {
+  await withGuest(async ({ port, seen }) => {
+    for (const [method, path] of [['GET', '/teamclaude/status'], ['POST', '/teamclaude/reload'], ['GET', '/teamclaude/dashboard'],
+      ['POST', '/api/event_logging/batch'], ['POST', '/tc-acct/jan/v1/messages'], ['GET', '/'], ['POST', '/v1/oauth/token']]) {
+      const res = await ask(port, { method, path });
+      assert.equal(res.status, 404, `${method} ${path}`);
+      await res.text();
+    }
+    assert.equal(seen.length, 0);
+  });
+});
+
+test('CONNECT and upgrades are refused at the socket', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const reply = (raw) => new Promise((resolve) => {
+      const s = net.connect(port, '127.0.0.1', () => s.write(raw));
+      let out = '';
+      s.on('data', d => { out += d; });
+      s.on('close', () => resolve(out));
+      s.on('error', () => resolve(out));
+    });
+    const c = await reply(`CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Authorization: Basic ${Buffer.from('ai:' + KEY).toString('base64')}\r\n\r\n`);
+    assert.match(c, /^HTTP\/1\.1 405/);
+    const u = await reply(`GET /v1/messages HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nx-api-key: ${KEY}\r\n\r\n`);
+    assert.match(u, /^HTTP\/1\.1 404/);
+    assert.equal(seen.length, 0);
+  });
+});
+
+test('a pin to an unconfigured account is 503, never rotation', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const res = await ask(port);
+    assert.equal(res.status, 503);
+    assert.equal(seen.length, 0);
+  }, { guests: guestsConfig({ account: 'ghost' }) });
+});
+
+// The hard pin. Every failure the forwarding path knows how to fail over from
+// is aimed at the pinned account; the other account must never be asked.
+for (const [label, handler] of [
+  ['rate-limit 429 with headers', (req, res) => { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1', 'anthropic-ratelimit-requests-remaining': '0' }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}'); }],
+  ['headerless 429', (req, res) => { res.writeHead(429, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}'); }],
+  ['quota-rejected 429', (req, res) => { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600', 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-reset': String(Math.floor(Date.now() / 1000) + 3600) }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"quota"}}'); }],
+  ['529 overloaded', (req, res) => { res.writeHead(529, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"overloaded_error","message":"busy"}}'); }],
+  ['500', (req, res) => { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"api_error","message":"x"}}'); }],
+  ['401 dead credential', (req, res) => { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"authentication_error","message":"bad"}}'); }],
+  ['403 refused credential', (req, res) => { res.writeHead(403, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"permission_error","message":"no"}}'); }],
+]) {
+  test(`hard pin: ${label} on the pinned account never fails over to another account`, { timeout: 60_000 }, async () => {
+    await withGuest(async ({ port, seen }) => {
+      const res = await ask(port);
+      await res.text();
+      assert.notEqual(res.status, 200);
+      assert.ok(seen.length >= 1);
+      assert.deepEqual([...new Set(seen.map(s => s.who))], ['ai'], `asked: ${seen.map(s => s.who).join(',')}`);
+    }, { upstreamFor: { ai: handler } });
+  });
+}
+
+test('hard pin: a paused / exhausted pinned account is an error, not another account', async () => {
+  await withGuest(async ({ port, seen, am }) => {
+    am.accounts[1].status = 'exhausted';
+    am.accounts[1].resetAt = Date.now() + 3600_000;
+    am.markExhausted?.(1, Date.now() + 3600_000);
+    const res = await ask(port);
+    await res.text();
+    assert.ok(seen.every(s => s.who === 'ai'));
+  });
+});
+
+test('the daily cap answers 429 once reached, before anything is sent', async () => {
+  await withGuest(async ({ port, seen, guestUsage }) => {
+    const first = await ask(port);
+    await first.text();
+    assert.equal(first.status, 200);
+    assert.ok(guestUsage.tokensToday('nephew') >= 100);
+    const second = await ask(port);
+    const body = await second.json();
+    assert.equal(second.status, 429);
+    assert.match(body.error.message, /Daily limit reached/);
+    assert.ok(Number(second.headers.get('retry-after')) > 0);
+    assert.equal(seen.length, 1);
+  }, { guests: guestsConfig({ dailyTokenCap: 100 }) });
+});
+
+test('streaming usage (message_start + message_delta) is booked, cache included', async () => {
+  const sse = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1,"cache_read_input_tokens":40,"cache_creation_input_tokens":3}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"cache_read_input_tokens":40}}\n\n');
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  };
+  await withGuest(async ({ port, guestUsage }) => {
+    const res = await ask(port);
+    await res.text();
+    assert.equal(res.status, 200);
+    // 7 input + 43 cache (counted once, at message_start) + 9 output
+    assert.equal(guestUsage.tokensToday('nephew'), 59);
+  }, { upstreamFor: { ai: sse } });
+});
+
+test('a key added on reload works without a restart (keys read live)', async () => {
+  await withGuest(async ({ port, config }) => {
+    const before = await ask(port);
+    assert.equal(before.status, 401);
+    config.guests = guestsConfig();
+    const after = await ask(port);
+    await after.text();
+    assert.equal(after.status, 200);
+  }, { guests: { keys: [] } });
+});
+
+// ── the pin-leak fix on the MAIN listener (pre-existing bug) ─────────────────
+
+// Before KAN-3837 the 429 and 5xx one-hop failovers did not check the pin, so a
+// /tc-acct/ (or TC_ACCT) request could be answered by a different account.
+for (const status of [529, 500]) {
+  test(`main listener: a pinned request that gets ${status} does not hop to another account`, async () => {
+    const seen = [];
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        const who = String(req.headers.authorization || '').replace('Bearer t-', '');
+        seen.push(who);
+        if (who === 'beta') { res.writeHead(status, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"overloaded_error","message":"x"}}'); return; }
+        res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+      });
+    });
+    const upstreamPort = await listen(upstream);
+    const am = new AccountManager([oauth('alpha'), oauth('beta')], 0.98);
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+    const proxyPort = await listen(proxy);
+    try {
+      const res = await fetch(`http://127.0.0.1:${proxyPort}/tc-acct/beta/v1/messages`, { method: 'POST', headers: { 'x-api-key': 'k', 'content-type': 'application/json' }, body: '{"model":"x","messages":[]}' });
+      await res.text();
+      assert.equal(res.status, status);
+      assert.deepEqual([...new Set(seen)], ['beta']);
+    } finally {
+      proxy.closeAllConnections?.(); proxy.close();
+      upstream.closeAllConnections?.(); upstream.close();
+    }
+  });
+}
+
+test('main listener: an UNPINNED request still hops once on 529 (behaviour kept)', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const who = String(req.headers.authorization || '').replace('Bearer t-', '');
+      seen.push(who);
+      if (seen.length === 1) { res.writeHead(529, { 'content-type': 'application/json' }); res.end('{}'); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([oauth('alpha'), oauth('beta')], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, { method: 'POST', headers: { 'x-api-key': 'k', 'content-type': 'application/json' }, body: '{"model":"x","messages":[]}' });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(new Set(seen).size, 2);
+  } finally {
+    proxy.closeAllConnections?.(); proxy.close();
+    upstream.closeAllConnections?.(); upstream.close();
+  }
+});
+
+// ── listener lifecycle ──────────────────────────────────────────────────────
+
+test('startGuestListener refuses a wildcard host and does nothing without config', () => {
+  const logs = [];
+  const am = new AccountManager([oauth('ai')], 0.98);
+  const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '0.0.0.0', port: 3460 }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { log: m => logs.push(m) });
+  assert.equal(r.server, null);
+  assert.match(r.state.error, /wildcard/);
+  const off = startGuestListener({ accountManager: am, config: {}, guestUsage: new GuestUsageTracker() }, { log: () => {} });
+  assert.equal(off.server, null);
+  assert.equal(off.state.listening, false);
+});
+
+test('startGuestListener retries an address that is not on this machine, never another', async () => {
+  const logs = [];
+  const am = new AccountManager([oauth('ai')], 0.98);
+  // TEST-NET-1: never assigned to a local interface.
+  const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '192.0.2.1', port: 3460 }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { retryMs: 30, log: m => logs.push(m) });
+  await new Promise(resolve => setTimeout(resolve, 120));
+  r.stop();
+  assert.equal(r.state.listening, false);
+  assert.ok(logs.filter(l => /retrying/.test(l)).length >= 2, logs.join('\n'));
+  assert.ok(!r.server.listening);
+});
+
+test('startGuestListener binds the configured address', async () => {
+  const am = new AccountManager([oauth('ai')], 0.98);
+  const probe = net.createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r));
+  const port = probe.address().port; await new Promise(r => probe.close(r));
+  const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '127.0.0.1', port }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { log: () => {} });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  try {
+    assert.equal(r.state.listening, true);
+    assert.equal(r.server.address().address, '127.0.0.1');
+  } finally { r.stop(); }
+});
+
+test('teamclaude status renders a Guests section', async () => {
+  const { renderStatus } = await import('../src/status-renderer.js');
+  const out = renderStatus({ accounts: [], guests: { listen: { host: '100.99.200.17', port: 3460 }, listening: { listening: false, error: 'EADDRNOTAVAIL' },
+    keys: [{ name: 'nephew', account: 'ai@x', enabled: true, dailyTokenCap: 3000000, tokensToday: 1234, requestsToday: 2, lastSeen: null }] } }, { color: false });
+  const text = Array.isArray(out) ? out.join('\n') : out;
+  assert.match(text, /Guests 100\.99\.200\.17:3460, not listening \(EADDRNOTAVAIL\)/);
+  assert.match(text, /nephew {2}enabled {2}→ ai@x {2}1,234\/3,000,000 tokens today, 2 req/);
+});

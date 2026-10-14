@@ -1222,7 +1222,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: withGuestUsage(usageRecorder.onUsage, req.tcGuestUsage), stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1337,6 +1337,20 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
  * see, and this daemon treats an uncaught EPIPE as fatal. `writeSync` throws
  * where it is called, so the catch below is real.
  */
+// A guest request (guest.js) books its tokens, cache included, against its own
+// daily cap through the same hook the per-client counters use.
+/**
+ * @param {((i: number, o: number, c?: number) => void)|null} onUsage
+ * @param {unknown} guestUsage
+ */
+function withGuestUsage(onUsage, guestUsage) {
+  if (typeof guestUsage !== 'function') return onUsage;
+  return (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache) => {
+    onUsage?.(input, output, cache);
+    guestUsage(input, output, cache);
+  };
+}
+
 function reportFailure(...args) {
   try {
     console.error(...args);
@@ -2736,7 +2750,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      // Never for a pinned request: a pin names exactly one account, and a hop
+      // would serve it from another (KAN-3837).
+      if (ctx.pinnedIndex == null && !ctx.rateLimitHopped && retryCount < maxRetries) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.
@@ -2890,7 +2906,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
+    // Not for a pinned request either, for the same reason as the 429 hop.
+    if (ctx.pinnedIndex == null && upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
@@ -3362,11 +3379,18 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
 //
 // Reads one `data:` line. Both dialects carry exactly one per event, so a line
 // is an event for this purpose, and the scanner above never has to hold more.
+// Anthropic reports prompt-cache writes and reads apart from input_tokens.
+// Counted once, from message_start (message_delta repeats them cumulatively).
+/** @param {any} usage */
+function cacheTokensOf(usage) {
+  return (Number(usage?.cache_creation_input_tokens) || 0) + (Number(usage?.cache_read_input_tokens) || 0);
+}
+
 /**
  * @param {string} line
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheTokens?: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  */
@@ -3377,7 +3401,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     const data = JSON.parse(line.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      onUsage?.(data.message.usage.input_tokens || 0, 0);
+      onUsage?.(data.message.usage.input_tokens || 0, 0, cacheTokensOf(data.message.usage));
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
@@ -3418,7 +3442,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0, isResponsesBody(json) ? 0 : cacheTokensOf(usage));
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
     }
   } catch {

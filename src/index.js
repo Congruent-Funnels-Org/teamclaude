@@ -39,6 +39,8 @@ import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpd
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
+import { GuestUsageTracker, startGuestListener, guestStatus } from './guest.js';
+import { guestCommand } from './guest-cli.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
@@ -174,6 +176,11 @@ switch (command) {
     await distributeCommand();
     process.exit(0);
     break;
+  case 'guest':
+  case 'guests':
+    await guestCommand(args.slice(1));
+    process.exit(process.exitCode || 0);
+    break;
   case 'route':
   case 'routes':
     await routeCommand();
@@ -301,6 +308,12 @@ async function serverCommand() {
   if (savedState?.clients) clientUsage.restore(savedState.clients);
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
+  // Guest keys' counters (config.guests): today's tokens are what the daily cap
+  // reads, so they survive a restart like the per-client counters.
+  const guestUsage = new GuestUsageTracker();
+  if (savedState?.guests) guestUsage.restore(savedState.guests);
+  /** @type {ReturnType<typeof startGuestListener>|null} */
+  let guestListener = null;
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
@@ -308,7 +321,7 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export(), guests: guestUsage.export() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -447,6 +460,11 @@ async function serverCommand() {
     // Both are read per request off this object (server.js) and the TUI already
     // persists them; without this a hand edit or another writer waited for a restart.
     config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Guest keys are read per request, so add/rotate/disable is a reload. The
+    // listen address is a socket: a change to it waits for a restart.
+    if (diskConfig.guests || config.guests) {
+      config.guests = { ...(config.guests || {}), keys: diskConfig.guests?.keys || [] };
+    }
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
@@ -595,6 +613,8 @@ async function serverCommand() {
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
+    // Guest keys (config.guests): counters + cap per key, never a key or hash.
+    guests: guestStatus(config, guestUsage, guestListener?.state ?? null),
     server: {
       version: serverVersion,
       versionLabel,
@@ -691,6 +711,11 @@ async function serverCommand() {
     }
   });
 
+  // The guest door (config.guests.listen), off unless configured. Its own
+  // server on its own address; it retries until the address exists and never
+  // binds anything else.
+  guestListener = startGuestListener({ accountManager, config, hooks, sx, guestUsage });
+
   // Reflect the active account in the terminal title so a backgrounded/tabbed
   // server is glanceable. Works in both TUI and headless modes.
   const stopTitle = startTerminalTitleUpdater(accountManager);
@@ -743,6 +768,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    guestListener?.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
