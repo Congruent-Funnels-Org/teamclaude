@@ -1333,7 +1333,7 @@ test('stream logs: a refused body is logged to its first 64 KB only, the request
       assert.equal(readFileSync(join(ddir, reqFile), 'utf8'), big.slice(0, 64 * 1024));   // raw bytes, not re-serialised
       const meta = JSON.parse(readFileSync(join(ddir, reqFile.replace('.req.json', '.meta.json')), 'utf8'));
       assert.equal(meta.bodyTruncatedFrom, Buffer.byteLength(big));
-      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), /refused body, .* first 64 KB kept/);
+      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), /unbilled request, body .* first 64 KB kept/);
     }, { guests: { ...guestsConfig(), logDir: dir }, configExtra: {} });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1458,16 +1458,16 @@ test('stream logs: 1000 refused bodies log at most the refused cap; an older day
       const files = readdirSync(tdir);
       let bytes = 0;
       for (const f of files) bytes += statSync(join(tdir, f)).size;
-      assert.ok(bytes <= GUEST_LOG_DEFAULTS.refusedBytesPerDay + 200_000, String(bytes));
+      assert.ok(bytes <= GUEST_LOG_DEFAULTS.unbilledBytesPerDay + 200_000, String(bytes));
       const metas = files.filter(f => f.endsWith('.meta.json')).map(f => JSON.parse(readFileSync(join(tdir, f), 'utf8')));
-      const refused = metas.filter(m => m.refused);
-      assert.ok(refused.length <= GUEST_LOG_DEFAULTS.refusedPerDay, String(refused.length));
-      assert.equal(metas.filter(m => !m.refused).length, 1);        // the real one, in full
-      const skipped = JSON.parse(readFileSync(join(tdir, 'refused-not-logged.json'), 'utf8')).count;
+      const refused = metas.filter(m => m.unbilled);
+      assert.ok(refused.length <= GUEST_LOG_DEFAULTS.unbilledPerDay, String(refused.length));
+      assert.equal(metas.filter(m => !m.unbilled).length, 1);        // the real one, in full
+      const skipped = JSON.parse(readFileSync(join(tdir, 'unbilled.json'), 'utf8')).notLogged;
       assert.equal(skipped + refused.length, 1000);
-      assert.equal(statSync(join(tdir, 'refused-not-logged.json')).mode & 0o777, 0o600);
+      assert.equal(statSync(join(tdir, 'unbilled.json')).mode & 0o777, 0o600);
       assert.equal(existsSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json')), true);
-      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), new RegExp(`${skipped} refused request\\(s\\) not logged`));
+      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), new RegExp(`${skipped} unbilled request\\(s\\) .* not logged`));
     }, { guests: { ...guestsConfig({ requestsPerMinute: 5000 }), logDir: dir, logMaxMB: 20 } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1491,9 +1491,84 @@ test('stream logs: an upstream error answer is logged as refused (body capped to
       const req = readdirSync(tdir).find(f => f.endsWith('.req.json'));
       assert.ok(statSync(join(tdir, req)).size <= 64 * 1024);
       const meta = JSON.parse(readFileSync(join(tdir, req.replace('.req.json', '.meta.json')), 'utf8'));
-      assert.equal(meta.refused, true);
+      assert.equal(meta.unbilled, true);
       assert.equal(meta.bodyTruncatedFrom, Buffer.byteLength(body));
       assert.match(readFileSync(join(tdir, req.replace('.req.json', '.res.sse')), 'utf8'), /model: not found/);
     }, { upstreamFor: { ai: reject }, guests: { ...guestsConfig(), logDir: dir } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: 1000 x 1 MB count_tokens 200s stay under the unbilled cap; an older day survives; a real /v1/messages is logged in full', { timeout: 120_000 }, async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { GUEST_LOG_DEFAULTS } = await import('../src/guest-log.js');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-count-'));
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  mkdirSync(join(dir, 'nephew', yesterday), { recursive: true });
+  writeFileSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json'), '{"real":"yesterday"}');
+  const counter = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ input_tokens: 333333 }));
+  };
+  try {
+    await withGuest(async ({ port, guestUsage }) => {
+      const big = JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'q'.repeat(1024 * 1024) }] });
+      for (let i = 0; i < 1000; i++) {
+        const r = await ask(port, { path: '/v1/messages/count_tokens?beta=true', body: big });
+        assert.equal(r.status, 200);
+        await r.text();
+      }
+      const m = await ask(port, { method: 'GET', path: '/v1/models' }); await m.text();
+      const bigMsg = JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'r'.repeat(200_000) }] });
+      const real = await ask(port, { body: bigMsg }); await real.text();
+      assert.equal(real.status, 200);
+      await new Promise(res => setTimeout(res, 2300));
+      const today = new Date().toISOString().slice(0, 10);
+      const tdir = join(dir, 'nephew', today);
+      const files = readdirSync(tdir);
+      let bytes = 0;
+      for (const f of files) bytes += statSync(join(tdir, f)).size;
+      // the cap, plus the one real request
+      assert.ok(bytes <= GUEST_LOG_DEFAULTS.unbilledBytesPerDay + Buffer.byteLength(bigMsg) + 50_000, String(bytes));
+      const metas = files.filter(f => f.endsWith('.meta.json')).map(f => ({ f, m: JSON.parse(readFileSync(join(tdir, f), 'utf8')) }));
+      const billed = metas.filter(x => !x.m.unbilled);
+      assert.equal(billed.length, 1);
+      assert.equal(readFileSync(join(tdir, billed[0].f.replace('.meta.json', '.req.json')), 'utf8'), bigMsg);
+      const unbilled = metas.filter(x => x.m.unbilled);
+      assert.ok(unbilled.length <= GUEST_LOG_DEFAULTS.unbilledPerDay);
+      assert.ok(unbilled.every(x => statSync(join(tdir, x.f.replace('.meta.json', '.req.json'))).size <= 64 * 1024));
+      const counts = JSON.parse(readFileSync(join(tdir, 'unbilled.json'), 'utf8'));
+      assert.equal(counts.entries + counts.notLogged, 1001);        // 1000 count_tokens + /v1/models
+      assert.equal(existsSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json')), true);
+      assert.equal(guestUsage.tokensToday('nephew') > 0, true);   // the real completion is booked (worst case: no usage in this mock)
+    }, { upstreamFor: { ai: counter }, guests: { ...guestsConfig({ requestsPerMinute: 5000 }), logDir: dir, logMaxMB: 20 } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: the unbilled cap is seeded from the day folder after a restart', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { openGuestLog, resetGuestLogUnbilled, guestLogUnbilled, GUEST_LOG_DEFAULTS } = await import('../src/guest-log.js');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-seed-'));
+  const config = { guests: { logDir: dir } };
+  const today = new Date().toISOString().slice(0, 10);
+  const tdir = join(dir, 'nephew', today);
+  mkdirSync(tdir, { recursive: true });
+  writeFileSync(join(tdir, 'unbilled.json'), JSON.stringify({ entries: GUEST_LOG_DEFAULTS.unbilledPerDay, bytes: 1000, notLogged: 7 }));
+  try {
+    resetGuestLogUnbilled();
+    const first = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{}') });
+    first.end(200, true);                                         // creates the counter, starts the seed read
+    await guestLogUnbilled(tdir);
+    const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{}') });
+    e.end(200, true);
+    await new Promise(res => setTimeout(res, 50));
+    const c = await guestLogUnbilled(tdir);
+    assert.ok(c.entries >= GUEST_LOG_DEFAULTS.unbilledPerDay);
+    assert.ok(c.notLogged >= 8, JSON.stringify(c));                // the second one was over the seeded cap
+    assert.ok(readdirSync(tdir).filter(f => f.endsWith('.req.json')).length <= 1);
+    assert.equal(existsSync(join(tdir, 'unbilled.json')), true);
+  } finally { resetGuestLogUnbilled(); rmSync(dir, { recursive: true, force: true }); }
 });

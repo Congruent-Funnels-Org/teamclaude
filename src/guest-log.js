@@ -30,16 +30,19 @@ export const GUEST_LOG_DEFAULTS = {
   maxMB: 5000,
   pruneEveryMs: 24 * 3600_000,
   maxQueuedBytes: 64 * 1024 * 1024, // held while the file opens; more is dropped
-  // A refused request costs the guest nothing, so its logging is capped per
-  // guest per UTC day: past either limit it is only counted (refused-not-logged.json).
-  refusedPerDay: 200,
-  refusedBytesPerDay: 16 * 1024 * 1024,
-  refusedBodyBytes: 64 * 1024,
+  // An unbilled request (refused, an upstream error, count_tokens, models)
+  // costs the guest nothing, so its logging is capped per guest per UTC day:
+  // past either limit it is only counted (unbilled.json).
+  unbilledPerDay: 200,
+  unbilledBytesPerDay: 16 * 1024 * 1024,
+  unbilledBodyBytes: 64 * 1024,
 };
 
 // Only files this module writes are ever deleted.
-const LOG_FILE_RE = /^(\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)|refused-not-logged\.json)$/;
-export const SKIPPED_FILE = 'refused-not-logged.json';
+const LOG_FILE_RE = /^(\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)|unbilled\.json)$/;
+// Per day folder: { entries, bytes, notLogged } of today's unbilled logging,
+// so the cap holds across a restart.
+export const UNBILLED_FILE = 'unbilled.json';
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'proxy-authorization', 'cookie', 'set-cookie']);
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -135,57 +138,70 @@ function spend(config, dir, n, log) {
 }
 
 /**
- * Refused-request logging per guest per UTC day: { entries, bytes, skipped }.
- * @type {Map<string, {day: string, dir: string, entries: number, bytes: number, skipped: number, fromDisk: number, timer: any}>}
+ * Unbilled-request logging per guest per UTC day: { entries, bytes, notLogged },
+ * seeded from the day folder's unbilled.json so a restart keeps the cap.
+ * @type {Map<string, {day: string, dir: string, entries: number, bytes: number, notLogged: number, timer: any, ready: Promise<void>}>}
  */
-const refusedDays = new Map();
+const unbilledDays = new Map();
 
 /** @param {string} dir the day folder @param {string} day */
-function refusedOf(dir, day) {
-  let q = refusedDays.get(dir);
+function unbilledOf(dir, day) {
+  let q = unbilledDays.get(dir);
   if (!q) {
-    for (const [k, v] of refusedDays) if (v.day !== day) { if (v.timer) clearTimeout(v.timer); refusedDays.delete(k); }
-    q = { day, dir, entries: 0, bytes: 0, skipped: 0, fromDisk: 0, timer: null };
-    refusedDays.set(dir, q);
-    // A restart keeps counting from what the file already says.
-    const rq = q;
-    readFile(join(dir, SKIPPED_FILE), 'utf8').then(t => { rq.fromDisk = Number(JSON.parse(t)?.count) || 0; }).catch(() => {});
+    for (const [k, v] of unbilledDays) if (v.day !== day) { if (v.timer) clearTimeout(v.timer); unbilledDays.delete(k); }
+    /** @type {any} */
+    const nq = { day, dir, entries: 0, bytes: 0, notLogged: 0, timer: null, ready: Promise.resolve() };
+    nq.ready = readFile(join(dir, UNBILLED_FILE), 'utf8').then(t => {
+      const d = JSON.parse(t) || {};
+      nq.entries += Number(d.entries) || 0;
+      nq.bytes += Number(d.bytes) || 0;
+      nq.notLogged += Number(d.notLogged) || 0;
+    }).catch(() => {});
+    unbilledDays.set(dir, nq);
+    q = nq;
   }
-  return q;
+  return /** @type {NonNullable<typeof q>} */ (q);
 }
 
-/** Note one more refused request not logged; the file is written at most every 2 s. */
-/** @param {{dir: string, skipped: number, fromDisk: number, timer: any}} q */
-function noteSkipped(q) {
-  q.skipped += 1;
+/** Save the day's unbilled counters, at most every 2 s. @param {ReturnType<typeof unbilledOf>} q */
+function saveUnbilled(q) {
   if (q.timer) return;
   q.timer = setTimeout(() => {
     q.timer = null;
-    mkdir(q.dir, { recursive: true, mode: 0o700 })
-      .then(() => writeFile(join(q.dir, SKIPPED_FILE), JSON.stringify({ count: q.fromDisk + q.skipped }), { mode: 0o600 }))
+    q.ready
+      .then(() => mkdir(q.dir, { recursive: true, mode: 0o700 }))
+      .then(() => writeFile(join(q.dir, UNBILLED_FILE), JSON.stringify({ entries: q.entries, bytes: q.bytes, notLogged: q.notLogged }), { mode: 0o600 }))
       .catch(() => {});
   }, 2000);
   q.timer.unref?.();
 }
 
-/** For tests: forget the per-day refused counters. */
-export function resetGuestLogRefused() {
-  for (const v of refusedDays.values()) if (v.timer) clearTimeout(v.timer);
-  refusedDays.clear();
+/** For tests: forget the per-day unbilled counters (as a restart would). */
+export function resetGuestLogUnbilled() {
+  for (const v of unbilledDays.values()) if (v.timer) clearTimeout(v.timer);
+  unbilledDays.clear();
+}
+
+/** For tests: the day's unbilled counters once loaded. @param {string} dayDir */
+export async function guestLogUnbilled(dayDir) {
+  const q = unbilledDays.get(dayDir);
+  if (!q) return null;
+  await q.ready;
+  return { entries: q.entries, bytes: q.bytes, notLogged: q.notLogged };
 }
 
 /**
  * Start the log of one guest request. Returns null when logging is off.
- * Nothing is written until `begin(refused)`: an accepted request (2xx answer)
- * is logged in full; a refused one (refused here, or an error status from
- * upstream: either costs the guest nothing) keeps the first 64 KB of its body
- * and only up to refusedPerDay / refusedBytesPerDay per guest per UTC day,
- * after which it is only counted. `chunk` takes response bytes as they arrive
+ * Nothing is written until `begin(unbilled)`: a billed completion (a 2xx
+ * /v1/messages) is logged in full; anything that costs the guest nothing (a
+ * refusal here, an error status from upstream, count_tokens, models) keeps
+ * the first 64 KB of its body and only up to unbilledPerDay /
+ * unbilledBytesPerDay per guest per UTC day, after which it is only counted. `chunk` takes response bytes as they arrive
  * (held until begin), `end(status)` begins if needed and closes the file. The
  * body is written as the raw bytes received.
  * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
  *   presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
- * @returns {{begin: (refused: boolean) => void, chunk: (b: Buffer) => void, end: (status?: number) => void, reqPath: string, resPath: string, metaPath: string}|null}
+ * @returns {{begin: (unbilled: boolean) => void, chunk: (b: Buffer) => void, end: (status?: number, unbilled?: boolean) => void, reqPath: string, resPath: string, metaPath: string}|null}
  */
 export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
   if (!guestLogsEnabled(config)) return null;
@@ -216,18 +232,19 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   let queue = [];
   let queued = 0;
   let begun = false;
-  let dead = false;      // not logging this request (budget, refused cap, write error)
+  let dead = false;      // not logging this request (budget, unbilled cap, write error)
   let ended = false;
-  /** @type {ReturnType<typeof refusedOf>|null} */
-  let refusedQ = null;
+  /** @type {ReturnType<typeof unbilledOf>|null} */
+  let unbilledQ = null;
   /** @type {import('node:fs').WriteStream|null} */
   let stream = null;
 
   const write = (/** @type {Buffer} */ b) => {
-    // Refused requests' answers count against the guest's refused bytes too.
-    if (refusedQ) {
-      if (refusedQ.bytes + b.length > GUEST_LOG_DEFAULTS.refusedBytesPerDay) { dead = true; stream?.end(); return; }
-      refusedQ.bytes += b.length;
+    // An unbilled request's answer counts against the guest's unbilled bytes too.
+    if (unbilledQ) {
+      if (unbilledQ.bytes + b.length > GUEST_LOG_DEFAULTS.unbilledBytesPerDay) { dead = true; stream?.end(); return; }
+      unbilledQ.bytes += b.length;
+      saveUnbilled(unbilledQ);
     }
     // The answer counts against the size budget; past it the file stops here.
     if (!spend(config, base, b.length, log)) { dead = true; stream?.end(); return; }
@@ -237,26 +254,27 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
     queued += b.length;
   };
 
-  const begin = (/** @type {boolean} */ refused) => {
+  const begin = (/** @type {boolean} */ unbilled) => {
     if (begun) return;
     begun = true;
     const held = queue;
     queue = []; queued = 0;
-    const cut = refused && body.length > GUEST_LOG_DEFAULTS.refusedBodyBytes;
-    const reqBody = cut ? body.subarray(0, GUEST_LOG_DEFAULTS.refusedBodyBytes) : body;
-    const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, ...(refused ? { refused: true } : {}),
+    const cut = unbilled && body.length > GUEST_LOG_DEFAULTS.unbilledBodyBytes;
+    const reqBody = cut ? body.subarray(0, GUEST_LOG_DEFAULTS.unbilledBodyBytes) : body;
+    const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, ...(unbilled ? { unbilled: true } : {}),
       ...(cut ? { bodyTruncatedFrom: body.length } : {}), headers: cleanHeaders });
     const size = reqBody.length + meta.length;
-    if (refused) {
-      const q = refusedOf(dir, day);
-      if (q.entries >= GUEST_LOG_DEFAULTS.refusedPerDay || q.bytes + size > GUEST_LOG_DEFAULTS.refusedBytesPerDay) {
-        noteSkipped(q);
+    if (unbilled) {
+      const q = unbilledOf(dir, day);
+      saveUnbilled(q);
+      if (q.entries >= GUEST_LOG_DEFAULTS.unbilledPerDay || q.bytes + size > GUEST_LOG_DEFAULTS.unbilledBytesPerDay) {
+        q.notLogged += 1;
         dead = true;
         return;
       }
       q.entries += 1;
       q.bytes += size;
-      refusedQ = q;
+      unbilledQ = q;
     }
     if (!spend(config, base, size, log)) { dead = true; return; }
     for (const b of held) { if (dead) break; write(b); }
@@ -290,9 +308,9 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
       }
       write(Buffer.from(b));
     },
-    end(status) {
+    end(status, unbilled = false) {
       if (ended) return;
-      if (!begun) begin(Number(status) >= 400);
+      if (!begun) begin(unbilled || Number(status) >= 400);
       ended = true;
       if (stream) stream.end();
     },
@@ -507,8 +525,8 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
   const n = (/** @type {any} */ v) => Number(v || 0).toLocaleString('en-US');
   const out = [`Guest "${guest}", ${day} (UTC): ${files.length} request(s)`];
   try {
-    const skipped = Number(JSON.parse(await readFile(join(gdir, day, SKIPPED_FILE), 'utf8'))?.count) || 0;
-    if (skipped) out.push(`${n(skipped)} refused request(s) not logged (over the daily refused-log cap)`);
+    const skipped = Number(JSON.parse(await readFile(join(gdir, day, UNBILLED_FILE), 'utf8'))?.notLogged) || 0;
+    if (skipped) out.push(`${n(skipped)} unbilled request(s) (refusals, errors, count_tokens) not logged (over the daily cap)`);
   } catch { /* none */ }
   for (const f of files) {
     const stem = f.slice(0, -'.req.json'.length);
@@ -528,7 +546,7 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
     const msgs = Array.isArray(body.messages) ? body.messages : [];
     const lastUser = [...msgs].reverse().find((/** @type {any} */ m) => m?.role === 'user');
     if (lastUser) out.push(`USER: ${clip(textOf(lastUser.content), 2000) || '(no text)'}`);
-    if (req?.bodyTruncatedFrom) out.push(`(refused body, ${n(req.bodyTruncatedFrom)} bytes, first 64 KB kept)`);
+    if (req?.bodyTruncatedFrom) out.push(`(unbilled request, body ${n(req.bodyTruncatedFrom)} bytes, first 64 KB kept)`);
     if (a.error) out.push(`ERROR: ${clip(a.error, 500)}`);
     if (a.text) out.push(`ASSISTANT: ${clip(a.text, 4000)}`);
     if (a.tools.length) out.push(`TOOLS: ${a.tools.join(', ')}`);

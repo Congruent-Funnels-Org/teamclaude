@@ -1004,8 +1004,10 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       }
     };
     res.once('close', release);
-    res.once('close', () => entry?.end(res.statusCode));
-    /** A refusal after the body was read: answered, and kept (capped) in the stream log. */
+    // Only a billed completion is logged in full: everything else costs the
+    // guest nothing and goes under the unbilled cap (guest-log.js).
+    res.once('close', () => entry?.end(res.statusCode, !booked.completion));
+    /** A refusal after the body was read: answered, and kept (under the unbilled cap) in the stream log. */
     const refuse = (/** @type {number} */ status, /** @type {string} */ type, /** @type {string} */ message, /** @type {Record<string, string>} */ extra = {}) => {
       entry?.begin(true);
       entry?.chunk(Buffer.from(JSON.stringify({ type: 'error', error: { type, message } })));
@@ -1054,7 +1056,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       if (beta === undefined) delete req.headers['anthropic-beta'];
       else req.headers['anthropic-beta'] = beta;
       const log1 = entry;
-      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null, log1 ? (code) => log1.begin(code >= 400) : null);
+      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null, log1 ? (code) => log1.begin(code >= 400 || !booked.completion) : null);
       guestUsage.recordRequest(name);
       // The body is already read; the forwarder reads it again from this copy.
       const replay = /** @type {any} */ (Readable.from(body.length ? [body] : []));
