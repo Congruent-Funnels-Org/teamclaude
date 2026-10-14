@@ -10,7 +10,7 @@ import {
   isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight, checkGuestBody,
   guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
   findRemoteSource, stripLongContextBetas, zeroCacheFigures, guestBetas, mediaMinimum,
-  weighTokens, guestPct, modelPrice, weeklyWindow, guestWeeklyPct, guestPause5hPct,
+  weighTokens, guestPct, modelPrice, weeklyWindow, guestWeeklyPct, guestPause5hPct, MODEL_PRICES,
 } from '../src/guest.js';
 import { pruneGuestLogs, renderGuestTranscript, setGuestLogBytes, guestLogBytes, openGuestLog, runGuestLogPrune, resetGuestLogDays, guestLogDay, GUEST_LOG_DEFAULTS } from '../src/guest-log.js';
 import { sanitizeMultiline, sanitizeText, safeGuestLine } from '../src/safe-text.js';
@@ -21,12 +21,21 @@ import { join } from 'node:path';
 
 // Guest stream logs default ON and to ~/.local/share: every test here writes
 // under a temp dir instead (guest-log.js reads XDG_DATA_HOME per request).
-{
-  const { mkdtempSync } = await import('node:fs');
+// The operator notifier (jan-notify) is STUBBED first on PATH: a test must
+// never reach the real one (it toasts Jan's screen). The stub only records.
+const NOTIFY_LOG = await (async () => {
+  const { mkdtempSync, writeFileSync, chmodSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), 'tc-guest-xdg-'));
-}
+  const bin = mkdtempSync(join(tmpdir(), 'tc-guest-stubbin-'));
+  const logFile = join(bin, 'notify.log');
+  writeFileSync(join(bin, 'jan-notify'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logFile}'\n`);
+  chmodSync(join(bin, 'jan-notify'), 0o755);
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  process.env.TC_TEST_STUB_BIN = bin;
+  return logFile;
+})();
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -971,7 +980,7 @@ test('weighTokens: priced by model (one table), cache and web searches included,
   assert.equal(weighTokens(null), 0);
   assert.equal(weighTokens({ input_tokens: -5, output_tokens: 'x' }, 'claude-haiku-4-5'), 0);
   // the guest on Opus and the owner on Haiku: the guest's share is not hidden by token counts
-  assert.ok(weighTokens({ output_tokens: 1000 }, 'claude-opus-5') > 20 * weighTokens({ output_tokens: 1000 }, 'claude-haiku-5-5'));
+  assert.ok(weighTokens({ output_tokens: 1000 }, 'claude-opus-5') >= 5 * weighTokens({ output_tokens: 1000 }, 'claude-haiku-5-5'));
 });
 
 test('guestPct: key override, then guests.dailyWeeklyPct, then 30', () => {
@@ -1592,4 +1601,143 @@ test('M3: paused (429) while the account 5-hour window is over pause5hPct; unpau
     const ok2 = await ask(port); await ok2.text();
     assert.equal(ok2.status, 200);
   });
+});
+
+
+// ── critic 5 LOWs ──────────────────────────────────────────────────────────
+
+test('L4: every price row is floored at Haiku 4 ($1/$5/$0.10); Haiku 5.5 is priced at the floor', () => {
+  for (const p of (MODEL_PRICES)) {
+    assert.ok(p.input >= 1 && p.output >= 5 && p.cacheRead >= 0.1, JSON.stringify(p));
+  }
+  assert.deepEqual({ ...modelPrice('claude-haiku-5-5'), prefix: undefined }, { prefix: undefined, input: 1, output: 5, cacheRead: 0.1, known: true });
+  assert.equal(modelPrice('claude-opus-5-5').input, 4);
+  assert.equal(modelPrice('claude-fable-5-1').output, 50);
+});
+
+test('L3: an unknown model is the most expensive on the guest side, the cheapest on the account side, logged once', async () => {
+  assert.equal(modelPrice('claude-new-9').known, false);
+  assert.equal(modelPrice('claude-new-9').output, 75);
+  assert.equal(modelPrice('claude-new-9', 'min').output, 5);
+  assert.equal(Math.round(weighTokens({ output_tokens: 1e6 }, 'claude-new-9', 'min')), 5e6);
+  await withGuest(async ({ am, guestUsage, logs }) => {
+    am.recordTokenUsage(1, null, 'claude-new-9', { input_tokens: 0, output_tokens: 1000 });
+    am.recordTokenUsage(1, null, 'claude-new-9', { input_tokens: 0, output_tokens: 1000 });
+    am.recordTokenUsage(1, null, 'claude-haiku-4-5', { input_tokens: 0, output_tokens: 1000 });
+    assert.equal(logs.filter(l => /unknown model "claude-new-9"/.test(l)).length, 1, logs.join('\n'));
+    assert.equal(Math.round(guestUsage.share('nephew', 'ai').accountWeighted), 3 * 5000);   // all at $5/Mtok out
+  });
+});
+
+test('L1: entries without .done are closed out at the prune (incomplete meta, gzipped, .done last); active ones are left alone', async () => {
+  const dir = tmp('tc-guest-closeout-');
+  const day = join(dir, 'nephew', '2026-01-14');
+  mkdirSync(day, { recursive: true });
+  writeFileSync(join(day, '101500-abcdef01.req.json'), '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"crash"}]}');
+  writeFileSync(join(day, '101500-abcdef01.res.sse'), 'data: {"type":"message_start"}\n');
+  writeFileSync(join(day, '101500-abcdef01.res.sse.gz.tmp'), 'half');
+  const config = { guests: { logDir: dir, logMaxMB: 100 } };
+  try {
+    // an entry this process is still writing
+    const live = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"model":"m"}') });
+    assert.equal(await live.begin(false), 'logged');
+    const logs = [];
+    await runGuestLogPrune(config, m => logs.push(m));
+    const files = readdirSync(day).sort();
+    assert.deepEqual(files, ['101500-abcdef01.done', '101500-abcdef01.meta.json.gz', '101500-abcdef01.req.json.gz', '101500-abcdef01.res.sse.gz']);
+    const meta = JSON.parse(gz(join(day, '101500-abcdef01.meta.json.gz')));
+    assert.equal(meta.incomplete, true);
+    assert.equal(JSON.parse(readFileSync(join(day, '101500-abcdef01.done'), 'utf8')).incomplete, true);
+    assert.match(gz(join(day, '101500-abcdef01.req.json.gz')), /crash/);
+    for (const f of files) assert.equal(statSync(join(day, f)).mode & 0o777, 0o600, f);
+    assert.ok(logs.some(l => /closed out 1 unfinished entry/.test(l)), logs.join('\n'));
+    // the live one: not closed out by the prune, finished normally
+    const tdir = join(dir, 'nephew', todayUtc());
+    assert.equal(doneCount(tdir), 0);
+    live.chunk(Buffer.from('{"type":"message","content":[]}'));
+    live.end(200);
+    await live.finished;
+    assert.equal(doneCount(tdir), 1);
+    assert.equal(readFileSync(live.donePath, 'utf8').startsWith('{'), false);   // a normal .done, not a close-out
+    assert.match(await renderGuestTranscript({ dir, guest: 'nephew', date: '2026-01-14' }), /USER: crash/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L1: a finalize that fails still writes .done, with the error recorded', async () => {
+  const dir = tmp('tc-guest-finalize-err-');
+  const config = { guests: { logDir: dir } };
+  try {
+    const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"model":"m"}'), log: () => {} });
+    assert.equal(await e.begin(false), 'logged');
+    writeFileSync(e.metaPath, '{"someone":"else"}');            // finalize's wx meta write now fails
+    e.chunk(Buffer.from('answer'));
+    e.end(200);
+    await e.finished;
+    const done = JSON.parse(readFileSync(e.donePath, 'utf8'));
+    assert.match(done.error, /EEXIST/);
+    for (const part of ['req.json', 'res.sse', 'meta.json']) {
+      assert.equal(existsSync(e.donePath.replace('.done', `.${part}.gz`)), true, part);
+      assert.equal(existsSync(e.donePath.replace('.done', `.${part}`)), false, part);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L6: deleting UNSHIPPED entries calls the notifier (the PATH stub, never the real jan-notify)', async () => {
+  const { execFileSync } = await import('node:child_process');
+  // the stub is what resolves; the real notifier is not reachable from tests
+  const resolved = execFileSync('sh', ['-c', 'command -v jan-notify'], { encoding: 'utf8' }).trim();
+  assert.equal(resolved, join(process.env.TC_TEST_STUB_BIN, 'jan-notify'));
+  assert.ok(!resolved.includes('/.local/bin/'), resolved);
+  const dir = tmp('tc-guest-notify-');
+  const day = join(dir, 'nephew', '2026-10-01');
+  mkdirSync(day, { recursive: true });
+  writeFileSync(join(day, '000000-aaaaaaaa.res.sse.gz'), Buffer.alloc(1024 * 1024));
+  writeFileSync(join(day, '000000-aaaaaaaa.done'), 'x');
+  const before = existsSync(NOTIFY_LOG) ? readFileSync(NOTIFY_LOG, 'utf8') : '';
+  try {
+    const logs = [];
+    setGuestLogBytes(dir, 0);
+    await runGuestLogPrune({ guests: { logDir: dir, logMaxMB: 1 } }, m => logs.push(m));
+    assert.ok(logs.some(l => /WARNING deleted 1 UNSHIPPED/.test(l)), logs.join('\n'));
+    await waitFor(() => existsSync(NOTIFY_LOG) && readFileSync(NOTIFY_LOG, 'utf8').length > before.length);
+    const call = readFileSync(NOTIFY_LOG, 'utf8').slice(before.length);
+    assert.match(call, /^--why asked TeamClaude: guest logs LOST deleted 1 UNSHIPPED/);
+    // notifyCommand: false turns it off (the emptied past day folder went too)
+    assert.equal(existsSync(day), false);
+    mkdirSync(day, { recursive: true });
+    writeFileSync(join(day, '000000-bbbbbbbb.res.sse.gz'), Buffer.alloc(1024 * 1024));
+    writeFileSync(join(day, '000000-bbbbbbbb.done'), 'x');
+    const mid = readFileSync(NOTIFY_LOG, 'utf8');
+    await runGuestLogPrune({ guests: { logDir: dir, logMaxMB: 1, notifyCommand: false } }, m => logs.push(m));
+    await new Promise(r => setTimeout(r, 200));
+    assert.equal(readFileSync(NOTIFY_LOG, 'utf8'), mid);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a leftover .shipped.tmp (crashed shipper) never counts as shipped and is cleaned after an hour; a fresh one is kept', async () => {
+  const { utimesSync } = await import('node:fs');
+  const dir = tmp('tc-guest-shippedtmp-');
+  const day = join(dir, 'nephew', '2026-01-20');
+  mkdirSync(day, { recursive: true });
+  writeFileSync(join(day, '000000-aaaaaaaa.res.sse.gz'), Buffer.alloc(1000));
+  writeFileSync(join(day, '000000-aaaaaaaa.done'), 'x');
+  writeFileSync(join(day, '000000-aaaaaaaa.shipped.tmp'), 'x');
+  const old = (Date.now() - 2 * 3600_000) / 1000;
+  utimesSync(join(day, '000000-aaaaaaaa.shipped.tmp'), old, old);
+  writeFileSync(join(day, '000000-bbbbbbbb.res.sse.gz'), Buffer.alloc(1000));
+  writeFileSync(join(day, '000000-bbbbbbbb.done'), 'x');
+  writeFileSync(join(day, '000000-bbbbbbbb.shipped.tmp'), 'x');   // a shipper mid-rename
+  try {
+    // retention 1 day: only SHIPPED entries may go, and neither of these is
+    const r = await pruneGuestLogs({ dir, retentionDays: 1, maxMB: 100 });
+    assert.equal(r.removed.length, 0);
+    assert.equal(existsSync(join(day, '000000-aaaaaaaa.shipped.tmp')), false);   // old leftover cleaned
+    assert.equal(existsSync(join(day, '000000-aaaaaaaa.done')), true);
+    assert.equal(existsSync(join(day, '000000-bbbbbbbb.shipped.tmp')), true);    // fresh: kept
+    // once renamed to .shipped it counts, and retention removes the entry
+    writeFileSync(join(day, '000000-aaaaaaaa.shipped'), 'x');
+    const r2 = await pruneGuestLogs({ dir, retentionDays: 1, maxMB: 100 });
+    assert.equal(r2.removed.length, 1);
+    assert.equal(existsSync(join(day, '000000-aaaaaaaa.done')), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

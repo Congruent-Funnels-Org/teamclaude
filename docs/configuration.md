@@ -234,6 +234,6 @@ The guest stream logs are company data and kept for good; teamclaude only keeps 
 
 - An entry is `<logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.{req.json,res.sse,meta.json}.gz`. While the request runs the files are plain (no `.gz`); never ship those.
 - `<HHMMSS>-<reqid>.done` is written LAST, by an atomic rename, after all three `.gz` files are complete. Ship an entry only once its `.done` exists.
-- After uploading an entry, the shipper writes `<HHMMSS>-<reqid>.shipped` next to it (any content, mode 0600). That is the only file the shipper writes.
+- After uploading an entry, the shipper writes `<HHMMSS>-<reqid>.shipped.tmp` and renames it to `<HHMMSS>-<reqid>.shipped` (any content, mode 0600). Those are the only files the shipper writes. A `.shipped.tmp` never counts as shipped; one left over for more than an hour is removed by the prune.
 - teamclaude deletes local entries only when they are shipped (and older than `logRetentionDays`, or the local budget needs room), or, as a last resort when the local budget is full and nothing shipped is left, the oldest unshipped ones, with a loud `WARNING deleted N UNSHIPPED` log line.
 - `<day>/day.json` is local accounting (the guest's daily counters), not an entry; shipping it is optional.

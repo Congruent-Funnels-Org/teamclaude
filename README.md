@@ -61,7 +61,7 @@ Every field, plus environment variables and network tuning: [docs/configuration.
 
 ## Guest log shipping (contract)
 
-Guest stream logs (`config.guests`, see [configuration](docs/configuration.md#guest-log-shipping-contract)) land as `<logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.{req.json,res.sse,meta.json}.gz`, with a sibling `<HHMMSS>-<reqid>.done` written last (atomic rename). A shipper uploads entries that have `.done`, then writes `<HHMMSS>-<reqid>.shipped` next to them; teamclaude deletes local entries only once shipped, or (last resort, logged loudly) when the local disk budget is full.
+Guest stream logs (`config.guests`, see [configuration](docs/configuration.md#guest-log-shipping-contract)) land as `<logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.{req.json,res.sse,meta.json}.gz`, with a sibling `<HHMMSS>-<reqid>.done` written last (atomic rename). A shipper uploads entries that have `.done`, then writes `<HHMMSS>-<reqid>.shipped` next to them (via `<stem>.shipped.tmp` renamed into place); teamclaude deletes local entries only once shipped, or (last resort, logged loudly) when the local disk budget is full.
 
 ## How it works
 

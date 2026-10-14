@@ -36,6 +36,7 @@
 // go too. Pruned at start, once a day and when the budget fills.
 
 import { createWriteStream, createReadStream } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { mkdir, writeFile, readdir, readFile, stat, rm, rmdir, rename } from 'node:fs/promises';
 import { once } from 'node:events';
 import { pipeline } from 'node:stream/promises';
@@ -61,7 +62,10 @@ export const GUEST_LOG_DEFAULTS = {
 
 const STEM = '\\d{6}-[0-9a-f]{8}';
 // Only files this module (or the shipper, .shipped) writes are ever deleted.
-const LOG_FILE_RE = new RegExp(`^(${STEM}\\.((req\\.json|meta\\.json|res\\.sse)(\\.gz)?|done|done\\.tmp|shipped)|day\\.json)$`);
+const LOG_FILE_RE = new RegExp(`^(${STEM}\\.((req\\.json|meta\\.json|res\\.sse)(\\.gz(\\.tmp)?)?|done|done\\.tmp|shipped|shipped\\.tmp)|day\\.json)$`);
+const RAW_PARTS = ['req.json', 'res.sse', 'meta.json'];
+/** @type {Set<string>} `<day dir>/<stem>` of entries this process is still writing: never closed out */
+const activeEntries = new Set();
 const STEM_RE = new RegExp(`^(${STEM})\\.`);
 export const DAY_FILE = 'day.json';
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'proxy-authorization', 'cookie', 'set-cookie']);
@@ -220,10 +224,47 @@ export async function guestLogDay(dayDir) {
   return { allBytes: q.allBytes, unbilledEntries: q.unbilledEntries, unbilledBytes: q.unbilledBytes, notLogged: q.notLogged };
 }
 
-/** gzip `p` to `p.gz` (0600), then remove `p`. @param {string} p */
+/** gzip `p` to `p.gz` (0600, via a temp file renamed into place), then remove `p`. @param {string} p */
 async function gzipFile(p) {
-  await pipeline(createReadStream(p), createGzip(), createWriteStream(`${p}.gz`, { mode: 0o600, flags: 'wx' }));
+  // A leftover temp file would keep its own (maybe looser) mode: start fresh.
+  await rm(`${p}.gz.tmp`, { force: true });
+  await pipeline(createReadStream(p), createGzip(), createWriteStream(`${p}.gz.tmp`, { mode: 0o600, flags: 'w' }));
+  await rename(`${p}.gz.tmp`, `${p}.gz`);
   await rm(p);
+}
+
+/** @param {string} p */
+const exists = (p) => stat(p).then(() => true, () => false);
+
+/**
+ * Close out an entry that has no `.done` (a crash mid-request, a finalize that
+ * failed): logs are kept for good, so nothing is left in a state the shipper
+ * skips. A missing meta is written with `incomplete: true`; every plain part
+ * still there is gzipped; `.done` is written last, carrying the error or the
+ * close-out as JSON. Never throws.
+ * @param {string} dir the day folder @param {string} stem @param {{error?: string|null, meta?: Record<string, any>}} [o]
+ * @returns {Promise<boolean>} whether `.done` now exists
+ */
+export async function closeOutEntry(dir, stem, { error = null, meta = {} } = {}) {
+  const base = join(dir, stem);
+  try {
+    if (!(await exists(`${base}.meta.json`)) && !(await exists(`${base}.meta.json.gz`))) {
+      await writeFile(`${base}.meta.json`, JSON.stringify({ reqId: stem.slice(7), ...meta, incomplete: true,
+        closedOutAt: new Date().toISOString(), ...(error ? { error } : {}) }), { mode: 0o600, flag: 'wx' });
+    }
+    for (const part of RAW_PARTS) {
+      const p = `${base}.${part}`;
+      if (await exists(p)) await gzipFile(p);
+      else await rm(`${p}.gz.tmp`, { force: true });
+    }
+  } catch (err) {
+    error = `${error ? error + '; ' : ''}close-out: ${/** @type {any} */ (err)?.code || /** @type {any} */ (err)?.message || err}`;
+  }
+  try {
+    await writeFile(`${base}.done.tmp`, JSON.stringify({ at: new Date().toISOString(), incomplete: true, ...(error ? { error } : {}) }) + '\n', { mode: 0o600 });
+    await rename(`${base}.done.tmp`, `${base}.done`);
+    return true;
+  } catch { return false; }
 }
 
 /**
@@ -298,10 +339,12 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
     stream?.write(b);
   };
 
+  const entryKey = join(dir, stem);
+  const metaBase = { at: iso, reqId: id, guest, method, url };
   const finalize = async () => {
     try {
       if (stream) { stream.end(); if (!stream.closed) await once(stream, 'close'); }
-      if (failed) return;
+      if (failed) throw new Error('a log write failed earlier');
       const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, status: endStatus ?? null,
         ...(isUnbilled || Number(endStatus) >= 400 ? { unbilled: true } : {}),
         ...(truncatedFrom ? { bodyTruncatedFrom: truncatedFrom } : {}),
@@ -311,7 +354,11 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
       for (const p of [reqPath, resPath, metaPath]) await gzipFile(p);
       await writeFile(`${donePath}.tmp`, `${new Date().toISOString()}\n`, { mode: 0o600 });
       await rename(`${donePath}.tmp`, donePath);
-    } catch (err) { fail(err); } finally { settle(); }
+    } catch (err) {
+      fail(err);
+      // Kept for good: still closed out, the error recorded in meta and .done.
+      await closeOutEntry(dir, stem, { error: String(/** @type {any} */ (err)?.code || /** @type {any} */ (err)?.message || err), meta: { ...metaBase, status: endStatus ?? null } });
+    } finally { activeEntries.delete(entryKey); settle(); }
   };
 
   const begin = (/** @type {boolean} */ unbilled) => {
@@ -342,6 +389,7 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
       q.allBytes += size;
       if (unbilled) { q.unbilledEntries += 1; q.unbilledBytes += size; }
       saveDay(q);
+      activeEntries.add(entryKey);
       try {
         await mkdir(dir, { recursive: true, mode: 0o700 });
         await writeFile(reqPath, reqBody, { mode: 0o600, flag: 'wx' });
@@ -352,6 +400,9 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
       } catch (err) {
         fail(err);
         dead = true;
+        // Whatever got written is closed out, not left half-done.
+        await closeOutEntry(dir, stem, { error: String(/** @type {any} */ (err)?.code || /** @type {any} */ (err)?.message || err), meta: metaBase });
+        activeEntries.delete(entryKey);
         settle();
         return 'failed';
       }
@@ -413,6 +464,14 @@ async function scanDay(path) {
     const stem = /** @type {RegExpExecArray} */ (STEM_RE.exec(e.name))[1];
     let en = by.get(stem);
     if (!en) { en = { stem, files: [], bytes: 0, shipped: false }; by.set(stem, en); }
+    // A shipper's temp marker (`.shipped.tmp`, renamed to `.shipped` when the
+    // upload is done) never makes an entry shipped; one left over for an hour
+    // is a crashed shipper's and is cleaned up.
+    if (e.name.endsWith('.shipped.tmp')) {
+      let mtime = Date.now();
+      try { mtime = (await stat(join(path, e.name))).mtimeMs; } catch { /* gone */ }
+      if (Date.now() - mtime > 3_600_000) { try { await rm(join(path, e.name)); continue; } catch { /* keep it counted */ } }
+    }
     en.files.push(e.name);
     en.bytes += size;
     if (e.name.endsWith('.shipped')) en.shipped = true;
@@ -447,13 +506,17 @@ export const PRUNE_LOW = 0.8;
  * too), only YYYY-MM-DD folders in them, only this module's own files (and
  * the shipper's .shipped), never through a symlink, so a mistaken logDir (~,
  * /) can never lose anything else.
+ * First, every entry with no `.done` that this process is not writing (a
+ * crash, a failed finalize) is closed out (closeOutEntry): nothing is left
+ * where the shipper would skip it.
  * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number}} o
- * @returns {Promise<{removed: string[], unshippedRemoved: number, bytes: number, freed: number}>}
+ * @returns {Promise<{removed: string[], unshippedRemoved: number, closedOut: number, bytes: number, freed: number}>}
  */
 export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now() }) {
   /** @type {string[]} */
   const removed = [];
   let unshippedRemoved = 0;
+  let closedOut = 0;
   let freed = 0;
   /** @type {{path: string, day: string, en: {stem: string, files: string[], bytes: number, shipped: boolean}}[]} */
   const all = [];
@@ -461,7 +524,7 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
   const dayDirs = [];
   let bytes = 0;
   let guests;
-  try { guests = await readdir(dir, { withFileTypes: true }); } catch { return { removed, unshippedRemoved, bytes: 0, freed }; }
+  try { guests = await readdir(dir, { withFileTypes: true }); } catch { return { removed, unshippedRemoved, closedOut, bytes: 0, freed }; }
   const today = new Date(now).toISOString().slice(0, 10);
   const cutoff = new Date(now - retentionDays * 86_400_000).toISOString().slice(0, 10);
   for (const g of guests) {
@@ -472,7 +535,11 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
       if (!d.isDirectory() || !DAY_RE.test(d.name)) continue;
       const path = join(dir, g.name, d.name);
       dayDirs.push({ path, day: d.name });
-      const { entries, dayFileBytes } = await scanDay(path);
+      let scanned = await scanDay(path);
+      const open = scanned.entries.filter(en => !en.files.some(f => f.endsWith('.done')) && !activeEntries.has(join(path, en.stem)));
+      for (const en of open) if (await closeOutEntry(path, en.stem, { meta: { guest: g.name } })) closedOut += 1;
+      if (open.length) scanned = await scanDay(path);
+      const { entries, dayFileBytes } = scanned;
       bytes += dayFileBytes;
       for (const en of entries) all.push({ path, day: d.name, en });
     }
@@ -513,7 +580,27 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
     if (dayFileBytes) { try { await rm(join(d.path, DAY_FILE)); bytes -= dayFileBytes; freed += dayFileBytes; } catch { /* gone */ } }
     try { await rmdir(d.path); } catch { /* foreign files stay */ }
   }
-  return { removed, unshippedRemoved, bytes: Math.max(0, bytes), freed };
+  return { removed, unshippedRemoved, closedOut, bytes: Math.max(0, bytes), freed };
+}
+
+/**
+ * Tell the operator out of band: `guests.notifyCommand` (default `jan-notify`,
+ * looked up on PATH) run as `<cmd> --why asked <title> <body>`, detached, with
+ * no shell. `notifyCommand: false` turns it off. A missing or failing notifier
+ * is one log line, never an error.
+ * @param {any} config @param {string} title @param {string} body @param {(m: string) => void} log
+ */
+export function notifyOperator(config, title, body, log = console.log) {
+  const cmd = config?.guests?.notifyCommand === undefined ? 'jan-notify' : config.guests.notifyCommand;
+  if (!cmd || typeof cmd !== 'string') return;
+  try {
+    const child = execFile(cmd, ['--why', 'asked', title, body], { timeout: 10_000, windowsHide: true }, (err) => {
+      if (err) { try { log(`[TeamClaude] guest logs: notifier "${cmd}" failed (${/** @type {any} */ (err).code ?? err.message})`); } catch { /* nothing */ } }
+    });
+    child.unref?.();
+  } catch (err) {
+    try { log(`[TeamClaude] guest logs: notifier "${cmd}" could not run (${/** @type {any} */ (err)?.message || err})`); } catch { /* nothing */ }
+  }
 }
 
 /** @type {Set<string>} dirs with a prune running */
@@ -538,8 +625,11 @@ export function runGuestLogPrune(config, log = console.log) {
       setGuestLogBytes(dir, r.bytes, { keepFull: r.freed === 0 && r.bytes >= maxBytesOf(config) * PRUNE_HIGH });
       const shippedGone = r.removed.length - r.unshippedRemoved;
       if (shippedGone) log(`[TeamClaude] guest logs: pruned ${shippedGone} shipped entr${shippedGone === 1 ? 'y' : 'ies'}`);
+      if (r.closedOut) log(`[TeamClaude] guest logs: closed out ${r.closedOut} unfinished entr${r.closedOut === 1 ? 'y' : 'ies'} (marked incomplete)`);
       if (r.unshippedRemoved) {
-        log(`[TeamClaude] guest logs: WARNING deleted ${r.unshippedRemoved} UNSHIPPED entr${r.unshippedRemoved === 1 ? 'y' : 'ies'} (oldest first) to stay under guests.logMaxMB: the shipper is behind or not running, those logs are gone`);
+        const msg = `deleted ${r.unshippedRemoved} UNSHIPPED guest log entr${r.unshippedRemoved === 1 ? 'y' : 'ies'} (oldest first) to stay under guests.logMaxMB: the shipper is behind or not running, those logs are gone`;
+        log(`[TeamClaude] guest logs: WARNING ${msg}`);
+        notifyOperator(config, 'TeamClaude: guest logs LOST', msg, log);
       }
     })
     .catch(err => { try { log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`); } catch { /* nothing */ } })
@@ -640,7 +730,7 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
   if (!days.length) return `No logs for guest "${name}" in ${safeGuestLine(gdir, 300)}.`;
   const day = date || days[days.length - 1];
   if (!days.includes(day)) return `No logs for guest "${name}" on ${safeGuestLine(day, 10)}. Days with logs: ${days.slice(-10).join(', ')}`;
-  const stems = [...new Set((await readdir(join(gdir, day))).filter(f => /\.req\.json(\.gz)?$/.test(f) && STEM_RE.test(f))
+  const stems = [...new Set((await readdir(join(gdir, day)).catch(() => /** @type {string[]} */ ([]))).filter(f => /\.req\.json(\.gz)?$/.test(f) && STEM_RE.test(f))
     .map(f => /** @type {RegExpExecArray} */ (STEM_RE.exec(f))[1]))].sort();
   const n = (/** @type {any} */ v) => Number(v || 0).toLocaleString('en-US');
   const one = (/** @type {unknown} */ v, /** @type {number} */ max = 200) => safeGuestLine(String(v ?? ''), max);

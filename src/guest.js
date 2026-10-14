@@ -217,11 +217,21 @@ export function weeklyWindow(resetAt, now = Date.now()) {
 
 /**
  * The ONE price table both sides of a guest's share are weighed with: US$
- * per million tokens (Anthropic API list prices, 2026-10): input, output,
- * cache read. Cache writes are 1.25 × input (2 × for 1h writes). Matched on
- * the model id's start, first match wins; an unknown model is priced as the
- * most expensive one, so a guest can never look cheaper than he is.
+ * per million tokens: input, output, cache read. Cache writes are 1.25 ×
+ * input (2 × for 1h writes). Matched on the model id's start, first match wins.
+ *
+ * Source: Anthropic API list prices as given by the claude-api skill's
+ * "Current Models" table (cached 2026-10-06; platform.claude.com pricing),
+ * checked 2026-10-15: Fable 5.1 / 5 and Mythos $10 / $50 (cache read $0.25),
+ * Opus 5.5 $4 / $20 (read $0.20), Opus 5 / 4.8 / 4.7 / 4.6 $5 / $25, Sonnet 5.5
+ * / 5 $2 / $10 (read $0.20), Sonnet 4.6 $3 / $15, Haiku 5.5 $0.10 / $0.50,
+ * Haiku 4.5 $1 / $5. Older ids (Opus 4 / 4.1 $15 / $75, Haiku 3.5) from the
+ * same list's legacy rows. Cache reads not stated there are 0.1 × input.
+ *
+ * Every row is floored at Haiku 4 pricing ($1 / $5 / $0.10): no family can
+ * make a guest's tokens look cheaper than that (Haiku 5.5 is billed below it).
  */
+const PRICE_FLOOR = { input: 1, output: 5, cacheRead: 0.1 };
 export const MODEL_PRICES = [
   { prefix: 'claude-fable-', input: 10, output: 50, cacheRead: 0.25 },
   { prefix: 'claude-mythos-', input: 10, output: 50, cacheRead: 0.25 },
@@ -237,27 +247,37 @@ export const MODEL_PRICES = [
   { prefix: 'claude-haiku-5', input: 0.1, output: 0.5, cacheRead: 0.01 },
   { prefix: 'claude-haiku-4', input: 1, output: 5, cacheRead: 0.1 },
   { prefix: 'claude-3-5-haiku', input: 0.8, output: 4, cacheRead: 0.08 },
-];
+].map(p => ({ ...p, input: Math.max(p.input, PRICE_FLOOR.input), output: Math.max(p.output, PRICE_FLOOR.output),
+  cacheRead: Math.max(p.cacheRead, PRICE_FLOOR.cacheRead) }));
 const MOST_EXPENSIVE = MODEL_PRICES.reduce((a, b) => (b.output > a.output ? b : a));
+const CHEAPEST = MODEL_PRICES.reduce((a, b) => (b.output < a.output ? b : a));
 // A web search is billed per request: $10 per 1000.
 export const WEB_SEARCH_USD = 0.01;
 
-/** @param {unknown} model */
-export function modelPrice(model) {
+/**
+ * The price row for `model`. An unknown id is priced as the most expensive
+ * row (`unknown: 'max'`, the guest's side: he can never look cheaper than he
+ * is) or the cheapest (`'min'`, the account's side: the denominator can never
+ * look bigger than it is). `known` says whether a row matched.
+ * @param {unknown} model @param {'max'|'min'} [unknown]
+ */
+export function modelPrice(model, unknown = 'max') {
   const id = String(model ?? '').toLowerCase().replace(/^.*\//, '').replace(/\[.*\]$/, '');
-  return MODEL_PRICES.find(p => id.startsWith(p.prefix)) || MOST_EXPENSIVE;
+  const row = MODEL_PRICES.find(p => id.startsWith(p.prefix));
+  return row ? { ...row, known: true } : { ...(unknown === 'min' ? CHEAPEST : MOST_EXPENSIVE), known: false };
 }
 
 /**
  * What one message's usage cost, in micro-US$ (Anthropic field names), priced
- * by its model, web searches included. Both sides of a guest's share use it.
- * @param {any} usage @param {unknown} [model]
+ * by its model, web searches included. Both sides of a guest's share use it;
+ * `unknown` picks how an unknown model id is priced (see modelPrice).
+ * @param {any} usage @param {unknown} [model] @param {'max'|'min'} [unknown]
  * @returns {number}
  */
-export function weighTokens(usage, model) {
+export function weighTokens(usage, model, unknown = 'max') {
   if (!usage || typeof usage !== 'object') return 0;
   const n = (/** @type {unknown} */ v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
-  const p = modelPrice(model);
+  const p = modelPrice(model, unknown);
   const write = n(usage.cache_creation_input_tokens);
   const write1h = Math.min(write, n(usage.cache_creation?.ephemeral_1h_input_tokens));
   const usd = (n(usage.input_tokens) * p.input + (write - write1h) * p.input * 1.25 + write1h * p.input * 2
@@ -947,9 +967,20 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       const a = accountManager.accounts[idx];
       if (!a) return;
       sampleWeekly(accountManager, guestUsage, idx);
-      guestUsage.recordAccountWeighted(a.name, weighTokens(usage, model));
+      // The account's side: an unknown model counts as the cheapest, so the
+      // denominator never inflates and hides the guest's share. Said once per id.
+      if (!modelPrice(model).known) {
+        const id = safeLine(String(model ?? '(none)'), 80);
+        if (!unknownModels.has(id) && unknownModels.size < 100) {
+          unknownModels.add(id);
+          log(`[TeamClaude] guest share: unknown model "${id}" on account "${safeLine(a.name, 64)}", priced as the cheapest for the account side`);
+        }
+      }
+      guestUsage.recordAccountWeighted(a.name, weighTokens(usage, model, 'min'));
     })
     : () => {};
+  /** @type {Set<string>} unknown model ids already logged */
+  const unknownModels = new Set();
   /** @type {Map<string, number>} guests whose weekly reading is stale → when that was last logged (once an hour) */
   const staleLogged = new Map();
   /** @type {Map<string, number>} guests at their weekly ceiling → when that was last logged (once an hour) */
