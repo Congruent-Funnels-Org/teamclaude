@@ -1347,14 +1347,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 // A guest request (guest.js) books its tokens, cache included, against its own
 // daily cap through the same hook the per-client counters use.
 /**
- * @param {((i: number, o: number, c?: number) => void)|null} onUsage
+ * @param {((i: number, o: number, c?: number, cumulative?: any) => void)|null} onUsage
  * @param {unknown} guestUsage
  */
 function withGuestUsage(onUsage, guestUsage) {
   if (typeof guestUsage !== 'function') return onUsage;
-  return (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache) => {
+  return (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache, /** @type {any} */ cumulative) => {
     onUsage?.(input, output, cache);
-    guestUsage(input, output, cache);
+    guestUsage(input, output, cache, cumulative);
   };
 }
 
@@ -3397,7 +3397,7 @@ function cacheTokensOf(usage) {
  * @param {string} line
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number, cacheTokens?: number) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheTokens?: number, cumulative?: any) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  */
@@ -3412,7 +3412,9 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
-      onUsage?.(0, data.usage.output_tokens || 0);
+      // The delta's usage is cumulative; passed along for callers (the guest
+      // cap) that must see input a server-side tool added after message_start.
+      onUsage?.(0, data.usage.output_tokens || 0, 0, data.usage);
       if (merged) Object.assign(merged, data.usage);
     } else if (!responsesTurn?.settled) {
       // Both sides settle at once here, so unlike the Anthropic branches above
