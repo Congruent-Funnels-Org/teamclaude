@@ -35,7 +35,7 @@
 //   "guests": {
 //     "listen": { "host": "100.99.200.17", "port": 3460 },
 //     "dailyWeeklyPct": 30, "logBodies": true, "logRetentionDays": 90, "logMaxMB": 5000,
-//     "keys": [{ "name": "nephew", "keyHash": "<sha256 hex>",
+//     "keys": [{ "name": "phoebe", "keyHash": "<sha256 hex>",
 //                "account": "ai@example.com", "dailyWeeklyPct": 30,
 //                "dailyTokenCap": 100000000, "enabled": true }]
 //   }

@@ -98,7 +98,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
   "dailyWeeklyPct": 30, "weeklyPct": 60, "pause5hPct": 80,
   "logBodies": true, "logGuestMBPerDay": 500, "logRetentionDays": 90, "logMaxMB": 5000,
   "keys": [
-    { "name": "nephew", "keyHash": "<sha256 hex>", "account": "ai@example.com",
+    { "name": "phoebe", "keyHash": "<sha256 hex>", "account": "ai@example.com",
       "dailyWeeklyPct": 30, "dailyTokenCap": 100000000, "maxConcurrent": 8, "requestsPerMinute": 240, "enabled": true }
   ]
 }

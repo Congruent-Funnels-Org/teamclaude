@@ -88,7 +88,7 @@ async function deliverKey(key, keyFile, what) {
 /**
  * Tell the running server to reload. A server that is not running is fine (the
  * change applies when it starts); one that IS running and refuses or fails the
- * reload is an error: the command exits non-zero so a caller (`nephew off`)
+ * reload is an error: the command exits non-zero so a caller (`phoebe off`)
  * never believes a key is off while the server still honours it.
  * @param {any} config
  * @returns {Promise<'reloaded'|'no-server'|'failed'>}
