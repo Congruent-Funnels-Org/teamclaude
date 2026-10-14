@@ -163,6 +163,35 @@ function keyLimit(key, field) {
 }
 
 export const MAX_GUEST_MAX_TOKENS = 128_000;
+export const IMAGE_MIN_TOKENS = 1600;
+export const PDF_PAGE_TOKENS = 3000;
+export const PDF_UNKNOWN_TOKENS = 100_000;
+
+/**
+ * A floor for what images and PDFs cost beyond their bytes: 1600 per image,
+ * 3000 per PDF page (pages counted from the decoded PDF, 100k when unknown).
+ * @param {unknown} node @param {number} [depth] @returns {number}
+ */
+export function mediaMinimum(node, depth = 0) {
+  if (node == null || typeof node !== 'object' || depth > 64) return 0;
+  if (Array.isArray(node)) return node.reduce((sum, x) => sum + mediaMinimum(x, depth + 1), 0);
+  const o = /** @type {Record<string, any>} */ (node);
+  let n = 0;
+  if (o.type === 'image') n += IMAGE_MIN_TOKENS;
+  if (o.type === 'document' && o.source?.media_type === 'application/pdf') {
+    let pages = 0;
+    if (typeof o.source.data === 'string') {
+      try { pages = (Buffer.from(o.source.data, 'base64').toString('latin1').match(/\/Type\s*\/Page(?!s)/g) || []).length; } catch { pages = 0; }
+    }
+    n += pages > 0 ? pages * PDF_PAGE_TOKENS : PDF_UNKNOWN_TOKENS;
+  }
+  for (const [k, v] of Object.entries(o)) {
+    if (k === 'input' && o.type === 'tool_use') continue;
+    if (k === 'source') continue;
+    if (v && typeof v === 'object') n += mediaMinimum(v, depth + 1);
+  }
+  return n;
+}
 
 /**
  * The first content block (at any depth, tool_result content included) whose
@@ -195,14 +224,35 @@ export function findRemoteSource(node, depth = 0) {
 }
 
 /**
- * The anthropic-beta header minus any long-context beta (context-1m-*): the
- * reservation is sized for the standard window.
- * @param {unknown} value @returns {string|undefined}
+ * Betas a guest may send: the ones Claude Code uses for an ordinary session
+ * (matched up to their date). Everything else is dropped, notably context-1m
+ * (the reservation is sized for the standard window), files/MCP/threads/
+ * managed agents (input stored server-side), web search/advisor, cache
+ * keep-alive, fast mode and server-side fallbacks (spend the cap cannot see).
  */
+export const GUEST_BETA_PREFIXES = ['claude-code-', 'oauth-', 'interleaved-thinking-', 'context-management-', 'effort-',
+  'fine-grained-tool-streaming-', 'token-counting-', 'structured-outputs-', 'prompt-caching-scope-', 'redact-thinking-',
+  'thinking-', 'mid-conversation-', 'per-turn-control-', 'timing-', 'cache-diagnosis-', 'inline-tools-',
+  'extended-cache-ttl-', 'advanced-tool-use-'];
+
+/**
+ * The anthropic-beta value a guest request is forwarded with: only allow-listed
+ * betas, plus the OAuth beta when the pinned account is a subscription (a
+ * Claude Code on an API key never sends it, and upstream refuses an OAuth
+ * bearer without it).
+ * @param {unknown} value @param {{ oauth?: boolean }} [opts] @returns {string|undefined}
+ */
+export function guestBetas(value, { oauth = false } = {}) {
+  const kept = String(value ?? '').split(',').map(x => x.trim().toLowerCase())
+    .filter(x => x && GUEST_BETA_PREFIXES.some(p => x.startsWith(p)));
+  if (oauth && !kept.some(x => x.startsWith('oauth-'))) kept.push(OAUTH_BETA);
+  return kept.length ? [...new Set(kept)].join(',') : undefined;
+}
+export const OAUTH_BETA = 'oauth-2025-04-20';
+
+/** Kept for callers: the allowlist, without the OAuth addition. @param {unknown} value */
 export function stripLongContextBetas(value) {
-  if (value == null) return undefined;
-  const kept = String(value).split(',').map(x => x.trim()).filter(x => x && !/^context-1m/i.test(x));
-  return kept.length ? kept.join(',') : undefined;
+  return guestBetas(value);
 }
 
 /** A tool the CLIENT runs (name + input_schema, no type or type "custom"). @param {any} t */
@@ -233,6 +283,12 @@ export function checkGuestBody(pathname, headers, body) {
   if (json.tools != null && !Array.isArray(json.tools)) return { ok: false, status: 400, type: 'invalid_request_error', message: 'tools must be a list.' };
   // Anything that makes the real input much bigger than the bytes sent: input
   // fetched or stored server-side is invisible to the bytes/3 estimate.
+  // Server-side compaction runs an extra summarisation call billed in
+  // usage.iterations[]; clearing edits (clear_*) cost nothing extra and stay.
+  const edits = json.context_management?.edits;
+  if (edits != null && (!Array.isArray(edits) || edits.some((/** @type {any} */ e) => /^compact/i.test(String(e?.type ?? ''))))) {
+    return { ok: false, status: 400, type: 'invalid_request_error', message: 'Server-side compaction is not available through this relay.' };
+  }
   for (const field of ['thread', 'container']) {
     if (json[field] != null) return { ok: false, status: 400, type: 'invalid_request_error', message: `"${field}" is not available through this relay.` };
   }
@@ -241,7 +297,7 @@ export function checkGuestBody(pathname, headers, body) {
   if (json.mcp_servers != null && !(Array.isArray(json.mcp_servers) && json.mcp_servers.length === 0)) {
     return { ok: false, status: 400, type: 'invalid_request_error', message: 'MCP servers are not available through this relay.' };
   }
-  const inputEstimate = Math.ceil(body.length / 3);
+  const inputEstimate = Math.ceil(body.length / 3) + mediaMinimum(json.messages) + mediaMinimum(json.system);
   if (pathname === '/v1/messages/count_tokens') return { ok: true, estimate: inputEstimate, inputEstimate, maxTokens: 0 };
   const m = json.max_tokens;
   if (!Number.isInteger(m) || m <= 0 || m > MAX_GUEST_MAX_TOKENS) {
@@ -664,7 +720,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
     let reservation = 0;
     let released = false;
     // What this request has booked so far, to settle a cut-short answer.
-    const booked = { input: 0, output: 0, final: false, forwarded: false, maxTokens: 0, inputEstimate: 0, completion: false };
+    const booked = { input: 0, output: 0, extra: 0, final: false, forwarded: false, maxTokens: 0, inputEstimate: 0, completion: false };
     const release = () => {
       if (released) return;
       released = true;
@@ -717,7 +773,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       }
       state.reserved += reservation;
       for (const h of STRIPPED_REQUEST_HEADERS) delete req.headers[h];
-      const beta = stripLongContextBetas(req.headers['anthropic-beta']);
+      const pinned = accountManager.accounts[/** @type {number} */ (resolveAccountPin(accountManager, key.account.trim()))];
+      const beta = guestBetas(req.headers['anthropic-beta'], { oauth: pinned?.type === 'oauth' });
       if (beta === undefined) delete req.headers['anthropic-beta'];
       else req.headers['anthropic-beta'] = beta;
       guardResponse(res, identifiers);
@@ -748,6 +805,14 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         if (cumulative && typeof cumulative === 'object') {
           const total = (Number(cumulative.input_tokens) || 0) + (Number(cumulative.cache_creation_input_tokens) || 0) + (Number(cumulative.cache_read_input_tokens) || 0);
           if (total > booked.input) { add += total - booked.input; booked.input = total; }
+          // Server-side iterations (e.g. compaction) are billed per iteration:
+          // when their sum is larger than everything booked, book the rest.
+          if (Array.isArray(cumulative.iterations)) {
+            const it = cumulative.iterations.reduce((/** @type {number} */ sum, /** @type {any} */ x) => sum + (Number(x?.input_tokens) || 0) + (Number(x?.output_tokens) || 0)
+              + (Number(x?.cache_creation_input_tokens) || 0) + (Number(x?.cache_read_input_tokens) || 0), 0);
+            const have = booked.input + booked.output + booked.extra;   // everything booked, this call included
+            if (it > have) { add += it - have; booked.extra += it - have; }
+          }
         }
         guestUsage.recordTokens(name, add);
         persistNearCap(name, cap);

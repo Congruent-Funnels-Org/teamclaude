@@ -3451,7 +3451,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0, isResponsesBody(json) ? 0 : cacheTokensOf(usage));
+      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0, isResponsesBody(json) ? 0 : cacheTokensOf(usage), isResponsesBody(json) ? undefined : usage);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
     }
   } catch {

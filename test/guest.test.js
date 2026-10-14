@@ -9,7 +9,7 @@ import {
   hashGuestKey, newGuestKey, resolveGuestKey, presentedGuestKey,
   isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight, checkGuestBody,
   guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
-  findRemoteSource, stripLongContextBetas, zeroCacheFigures,
+  findRemoteSource, stripLongContextBetas, zeroCacheFigures, guestBetas, mediaMinimum,
 } from '../src/guest.js';
 
 function listen(server) {
@@ -783,4 +783,84 @@ test('usage crossing 90% of the cap is persisted at once', async () => {
     assert.equal(r.status, 200);
     assert.equal(saves, 1);
   }, { persist: async () => { saves += 1; }, guests: guestsConfig({ dailyTokenCap: 140 }) });
+});
+
+// ── bounce 4: compaction, beta allow-list, media floors ─────────────────────
+
+test('betas are allow-listed; the OAuth beta is added for a subscription pin', () => {
+  assert.equal(guestBetas('files-api-2025-04-14,mcp-servers-2025-12-04,web-search-2025-03-05,fast-mode-2026-02-01,cache-keepalive-2026-09-03,context-1m-2025-08-07,message-threads-2026-08-12'), undefined);
+  assert.equal(guestBetas('claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24,files-api-2025-04-14'), 'claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24');
+  assert.equal(guestBetas(undefined, { oauth: true }), 'oauth-2025-04-20');
+  assert.equal(guestBetas('oauth-2025-04-20', { oauth: true }), 'oauth-2025-04-20');
+  assert.equal(guestBetas('effort-2025-11-24', { oauth: false }), 'effort-2025-11-24');
+});
+
+test('a guest request to an OAuth pin carries the OAuth beta upstream, and no disallowed beta', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const r = await ask(port, { headers: { 'anthropic-beta': 'claude-code-20250219,files-api-2025-04-14,cache-keepalive-2026-09-03' } });
+    await r.text();
+    assert.equal(r.status, 200);
+    const b = String(seen[0].beta).split(',');
+    assert.ok(b.includes('oauth-2025-04-20') && b.includes('claude-code-20250219'), seen[0].beta);
+    assert.ok(!b.some(x => /files-api|cache-keepalive/.test(x)), seen[0].beta);
+  });
+});
+
+test('server-side compaction is refused; clearing edits pass', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const mk = (cm) => JSON.stringify({ model: 'm', max_tokens: 16, messages: [], context_management: cm });
+    for (const cm of [{ edits: [{ type: 'compact_20260112' }] }, { edits: [{ type: 'clear_tool_uses_20250919' }, { type: 'Compact' }] }, { edits: 'compact' }]) {
+      const r = await ask(port, { body: mk(cm) });
+      assert.equal(r.status, 400, JSON.stringify(cm));
+      await r.text();
+    }
+    assert.equal(seen.length, 0);
+    const ok = await ask(port, { body: mk({ edits: [{ type: 'clear_tool_uses_20250919' }, { type: 'clear_thinking_20251015' }] }) });
+    await ok.text();
+    assert.equal(ok.status, 200);
+  });
+});
+
+test('usage.iterations[] is booked when it exceeds the top-level figures (buffered and streamed)', async () => {
+  const body = (req, res) => { res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5, iterations: [{ input_tokens: 50000, output_tokens: 2000 }, { input_tokens: 10, output_tokens: 5 }] } })); };
+  await withGuest(async ({ port, guestUsage }) => {
+    const r = await ask(port); await r.text();
+    assert.equal(guestUsage.tokensToday('nephew'), 52015);
+  }, { upstreamFor: { ai: body } });
+  const sse = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5,"iterations":[{"input_tokens":30000,"output_tokens":1000},{"input_tokens":10,"output_tokens":5}]}}\n\n');
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  };
+  await withGuest(async ({ port, guestUsage }) => {
+    const r = await ask(port); await r.text();
+    assert.equal(guestUsage.tokensToday('nephew'), 31015);
+  }, { upstreamFor: { ai: sse } });
+  // without iterations nothing changes
+  await withGuest(async ({ port, guestUsage }) => {
+    const r = await ask(port); await r.text();
+    assert.equal(guestUsage.tokensToday('nephew'), 135);
+  });
+});
+
+test('images and PDFs reserve a floor beyond their bytes', () => {
+  const pdf = (pages) => ({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: Buffer.from('%PDF ' + '/Type /Page '.repeat(pages) + '/Type /Pages').toString('base64') } });
+  assert.equal(mediaMinimum([{ role: 'user', content: [{ type: 'image', source: { type: 'base64', data: 'x' } }, { type: 'image', source: { type: 'base64', data: 'y' } }] }]), 3200);
+  assert.equal(mediaMinimum([{ content: [pdf(2)] }]), 6000);
+  assert.equal(mediaMinimum([{ content: [pdf(0)] }]), 100000);
+  assert.equal(mediaMinimum([{ content: [{ type: 'tool_result', content: [{ type: 'image', source: {} }] }] }]), 1600);
+  assert.equal(mediaMinimum([{ content: [{ type: 'tool_use', input: { type: 'image' } }] }]), 0);
+  const est = checkGuestBody('/v1/messages', {}, Buffer.from(JSON.stringify({ max_tokens: 10, messages: [{ role: 'user', content: [pdf(0)] }] })));
+  assert.ok(est.ok && est.estimate >= 100010);
+});
+
+test('a PDF of unknown length is refused at a cap it cannot fit', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const r = await ask(port, { body: JSON.stringify({ model: 'm', max_tokens: 16, messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }] }] }) });
+    await r.text();
+    assert.equal(r.status, 429);
+    assert.equal(seen.length, 0);
+  }, { guests: guestsConfig({ dailyTokenCap: 50000 }) });
 });
