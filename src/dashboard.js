@@ -592,6 +592,10 @@ const PAGE = `<!doctype html>
       <h2>Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
     </div>
+    <div id="guestsWrap" style="display:none">
+      <h2>Guests</h2>
+      <div class="card" style="padding:4px 6px"><table id="guests"></table></div>
+    </div>
     <div id="dimensionsWrap"></div>
     <div id="sessionsWrap" style="display:none">
       <h2>Sessions</h2>
@@ -756,6 +760,32 @@ ${SHARED_HELPERS}
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
+      table.appendChild(tr);
+    });
+  }
+
+  // Guest keys (config.guests): one pinned account each, a daily cap.
+  function renderGuests(guests) {
+    var wrap = document.getElementById('guestsWrap');
+    var keys = (guests && guests.keys) || [];
+    if (!keys.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    var table = document.getElementById('guests');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Guest', 'Account', 'State', 'Tokens today', 'Cap', 'Req today', 'Last seen'].forEach(function (h, i) {
+      hr.appendChild(el('th', i > 2 ? 'num' : '', h));
+    });
+    table.appendChild(hr);
+    keys.forEach(function (k) {
+      var tr = el('tr');
+      tr.appendChild(el('td', '', k.name));
+      tr.appendChild(el('td', '', k.account || '—'));
+      tr.appendChild(el('td', '', k.enabled ? 'enabled' : 'disabled'));
+      tr.appendChild(el('td', 'num', fmtNum(k.tokensToday || 0)));
+      tr.appendChild(el('td', 'num', k.dailyTokenCap ? fmtNum(k.dailyTokenCap) : '—'));
+      tr.appendChild(el('td', 'num', fmtNum(k.requestsToday || 0)));
+      tr.appendChild(el('td', 'num', k.lastSeen ? fmtAgo(k.lastSeen) : '—'));
       table.appendChild(tr);
     });
   }
@@ -981,6 +1011,7 @@ ${SHARED_HELPERS}
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
+    renderGuests(s.guests);
     renderDimensions(s.usageDimensions);
     renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();

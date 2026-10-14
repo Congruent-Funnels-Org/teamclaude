@@ -91,6 +91,21 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     lines.push('');
   }
 
+  // Guest keys (config.guests) — only when some are configured.
+  const guestKeys = status.guests?.keys || [];
+  if (guestKeys.length) {
+    const g = status.guests;
+    const where = g.listen ? `${g.listen.host}:${g.listen.port}` : 'no listener';
+    const state = g.listening?.listening ? 'listening' : g.listen ? `not listening${g.listening?.error ? ' (' + g.listening.error + ')' : ''}` : 'off';
+    lines.push(`${paint.bold('Guests')} ${paint.dim(`${where}, ${state}`)}`);
+    for (const k of guestKeys) {
+      const cap = k.dailyTokenCap ? `/${Number(k.dailyTokenCap).toLocaleString('en-US')}` : '';
+      const seen = k.lastSeen ? `last seen ${k.lastSeen}` : 'never seen';
+      lines.push(`  ${safeLine(String(k.name))}  ${k.enabled ? 'enabled' : paint.dim('disabled')}  → ${safeLine(String(k.account || "?"))}  ${Number(k.tokensToday || 0).toLocaleString('en-US')}${cap} tokens today, ${k.requestsToday || 0} req  ${paint.dim(seen)}`);
+    }
+    lines.push('');
+  }
+
   // One section per configured usage dimension (proxy.usageDimensions). The
   // dimension list is operator config and each tracker is key-capped, so the
   // size of this output is bounded by the config file, not by caller traffic.
