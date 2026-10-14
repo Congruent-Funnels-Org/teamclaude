@@ -1,48 +1,69 @@
-// Guest stream logs (config.guests.logBodies, default on): the FULL request
-// and the FULL answer, as received from upstream, of every guest request that
-// got as far as a body, so the operator can see what a guest does.
+// Guest stream logs (config.guests.logBodies, default on): the request and
+// the answer, as received from upstream, of every guest request that got as
+// far as a body, so the operator can see what a guest does. Kept for good
+// (company data): local files go only once SHIPPED, or when the local disk
+// budget forces it.
 //
 //   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.req.json   the request body, raw bytes as received
-//   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.meta.json  time, method, url, headers (auth stripped)
 //   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.res.sse    the response body bytes, SSE or JSON
+//   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.meta.json  time, method, url, status, headers (auth stripped)
+//
+// While a request runs those are plain files. When it ends each is gzipped to
+// `<file>.gz` (0600) and the plain one removed, then `<HHMMSS>-<reqid>.done`
+// is written LAST (atomic rename): an entry with `.done` is complete. A
+// shipper uploads complete entries and writes `<HHMMSS>-<reqid>.shipped` next
+// to them; the prune treats shipped entries as safe to delete. `day.json` in
+// each day folder holds that guest-day's logging counters (local accounting).
 //
 // logDir defaults to ~/.local/share/teamclaude/guest-logs (guests.logDir).
 // Dirs 0700, files 0600. No credential is written: the guest's key, any auth
 // header and cookies are stripped, and account tokens never pass through here
 // (they are added by the forwarder, after this sees the request).
 //
-// Logging never blocks or fails a request: every write is async, and a write
-// error is one log line, the request goes on. Retention: guests.logRetentionDays
-// (default 90) and a size backstop guests.logMaxMB (default 5000, oldest days
-// first, freeing down to 80% once past 90%), pruned at start and once a day.
-// Between prunes a running byte count (seeded by each prune) stops all writing
-// once logMaxMB is reached, with one log line, and asks for a prune, which
-// frees room so logging resumes.
+// Logging FAILS CLOSED: a request that cannot be logged (the guest's daily
+// byte budget, guests.logGuestMBPerDay, default 500, or the global one
+// spent; the folder or file cannot be written) is refused before it is
+// forwarded (begin() answers 'failed'). An unbilled request (refused, an
+// upstream error, count_tokens, models) keeps 64 KB of its body and only the
+// first 200 / 16 MB of them per guest per UTC day; past that it is counted
+// ('counted') and still served. Writing the answer is async and never fails
+// the request; an error there is one log line.
+//
+// Local size backstop guests.logMaxMB (default 5000): past 90% a prune frees
+// down to 80%, shipped entries first (oldest first, any day), then unshipped
+// ones (oldest first, never today's unless today alone is over the cap) with
+// a loud log line. Shipped entries older than guests.logRetentionDays (90)
+// go too. Pruned at start, once a day and when the budget fills.
 
-import { createWriteStream } from 'node:fs';
-import { mkdir, writeFile, readdir, readFile, stat, rm, rmdir } from 'node:fs/promises';
+import { createWriteStream, createReadStream } from 'node:fs';
+import { mkdir, writeFile, readdir, readFile, stat, rm, rmdir, rename } from 'node:fs/promises';
+import { once } from 'node:events';
+import { pipeline } from 'node:stream/promises';
+import { createGzip, gunzipSync } from 'node:zlib';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { sanitizeMultiline, safeGuestLine } from './safe-text.js';
 
 export const GUEST_LOG_DEFAULTS = {
-  retentionDays: 90,
-  maxMB: 5000,
+  retentionDays: 90,              // for SHIPPED entries only
+  maxMB: 5000,                    // local disk budget, all guests
+  guestMBPerDay: 500,             // per guest per UTC day
   pruneEveryMs: 24 * 3600_000,
   maxQueuedBytes: 64 * 1024 * 1024, // held while the file opens; more is dropped
   // An unbilled request (refused, an upstream error, count_tokens, models)
   // costs the guest nothing, so its logging is capped per guest per UTC day:
-  // past either limit it is only counted (unbilled.json).
+  // past either limit it is only counted (day.json notLogged).
   unbilledPerDay: 200,
   unbilledBytesPerDay: 16 * 1024 * 1024,
   unbilledBodyBytes: 64 * 1024,
 };
 
-// Only files this module writes are ever deleted.
-const LOG_FILE_RE = /^(\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)|unbilled\.json)$/;
-// Per day folder: { entries, bytes, notLogged } of today's unbilled logging,
-// so the cap holds across a restart.
-export const UNBILLED_FILE = 'unbilled.json';
+const STEM = '\\d{6}-[0-9a-f]{8}';
+// Only files this module (or the shipper, .shipped) writes are ever deleted.
+const LOG_FILE_RE = new RegExp(`^(${STEM}\\.((req\\.json|meta\\.json|res\\.sse)(\\.gz)?|done|done\\.tmp|shipped)|day\\.json)$`);
+const STEM_RE = new RegExp(`^(${STEM})\\.`);
+export const DAY_FILE = 'day.json';
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'proxy-authorization', 'cookie', 'set-cookie']);
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -137,71 +158,86 @@ function spend(config, dir, n, log) {
   return true;
 }
 
-/**
- * Unbilled-request logging per guest per UTC day: { entries, bytes, notLogged },
- * seeded from the day folder's unbilled.json so a restart keeps the cap.
- * @type {Map<string, {day: string, dir: string, entries: number, bytes: number, notLogged: number, timer: any, ready: Promise<void>}>}
- */
-const unbilledDays = new Map();
-
-/** @param {string} dir the day folder @param {string} day */
-function unbilledOf(dir, day) {
-  let q = unbilledDays.get(dir);
-  if (!q) {
-    for (const [k, v] of unbilledDays) if (v.day !== day) { if (v.timer) clearTimeout(v.timer); unbilledDays.delete(k); }
-    /** @type {any} */
-    const nq = { day, dir, entries: 0, bytes: 0, notLogged: 0, timer: null, ready: Promise.resolve() };
-    nq.ready = readFile(join(dir, UNBILLED_FILE), 'utf8').then(t => {
-      const d = JSON.parse(t) || {};
-      nq.entries += Number(d.entries) || 0;
-      nq.bytes += Number(d.bytes) || 0;
-      nq.notLogged += Number(d.notLogged) || 0;
-    }).catch(() => {});
-    unbilledDays.set(dir, nq);
-    q = nq;
-  }
-  return /** @type {NonNullable<typeof q>} */ (q);
+/** @param {any} config */
+function guestMaxBytesOf(config) {
+  const mb = Number(config?.guests?.logGuestMBPerDay);
+  return (mb > 0 ? mb : GUEST_LOG_DEFAULTS.guestMBPerDay) * 1024 * 1024;
 }
 
-/** Save the day's unbilled counters, at most every 2 s. @param {ReturnType<typeof unbilledOf>} q */
-function saveUnbilled(q) {
+/**
+ * One guest's logging counters for one UTC day, seeded from the day folder's
+ * day.json so a restart keeps every cap: allBytes (the guest's daily budget),
+ * unbilledEntries / unbilledBytes (the unbilled cap), notLogged.
+ * @typedef {{day: string, dir: string, allBytes: number, unbilledEntries: number, unbilledBytes: number, notLogged: number, timer: any, ready: Promise<void>, fullLogged: boolean}} DayCounters
+ * @type {Map<string, DayCounters>}
+ */
+const guestDays = new Map();
+
+/** @param {string} dir the day folder @param {string} day @returns {DayCounters} */
+function dayOf(dir, day) {
+  let q = guestDays.get(dir);
+  if (!q) {
+    for (const [k, v] of guestDays) if (v.day !== day) { if (v.timer) clearTimeout(v.timer); guestDays.delete(k); }
+    /** @type {DayCounters} */
+    const nq = { day, dir, allBytes: 0, unbilledEntries: 0, unbilledBytes: 0, notLogged: 0, timer: null, ready: Promise.resolve(), fullLogged: false };
+    nq.ready = readFile(join(dir, DAY_FILE), 'utf8').then(t => {
+      const d = JSON.parse(t) || {};
+      nq.allBytes += Number(d.allBytes) || 0;
+      nq.unbilledEntries += Number(d.unbilledEntries) || 0;
+      nq.unbilledBytes += Number(d.unbilledBytes) || 0;
+      nq.notLogged += Number(d.notLogged) || 0;
+    }).catch(() => {});
+    guestDays.set(dir, nq);
+    q = nq;
+  }
+  return q;
+}
+
+/** Save a guest-day's counters, at most every 2 s. @param {DayCounters} q */
+function saveDay(q) {
   if (q.timer) return;
   q.timer = setTimeout(() => {
     q.timer = null;
     q.ready
       .then(() => mkdir(q.dir, { recursive: true, mode: 0o700 }))
-      .then(() => writeFile(join(q.dir, UNBILLED_FILE), JSON.stringify({ entries: q.entries, bytes: q.bytes, notLogged: q.notLogged }), { mode: 0o600 }))
+      .then(() => writeFile(join(q.dir, DAY_FILE), JSON.stringify({ allBytes: q.allBytes, unbilledEntries: q.unbilledEntries, unbilledBytes: q.unbilledBytes, notLogged: q.notLogged }), { mode: 0o600 }))
       .catch(() => {});
   }, 2000);
   q.timer.unref?.();
 }
 
-/** For tests: forget the per-day unbilled counters (as a restart would). */
-export function resetGuestLogUnbilled() {
-  for (const v of unbilledDays.values()) if (v.timer) clearTimeout(v.timer);
-  unbilledDays.clear();
+/** For tests: forget the per-day counters (as a restart would). */
+export function resetGuestLogDays() {
+  for (const v of guestDays.values()) if (v.timer) clearTimeout(v.timer);
+  guestDays.clear();
 }
 
-/** For tests: the day's unbilled counters once loaded. @param {string} dayDir */
-export async function guestLogUnbilled(dayDir) {
-  const q = unbilledDays.get(dayDir);
+/** For tests: a guest-day's counters once loaded. @param {string} dayDir */
+export async function guestLogDay(dayDir) {
+  const q = guestDays.get(dayDir);
   if (!q) return null;
   await q.ready;
-  return { entries: q.entries, bytes: q.bytes, notLogged: q.notLogged };
+  return { allBytes: q.allBytes, unbilledEntries: q.unbilledEntries, unbilledBytes: q.unbilledBytes, notLogged: q.notLogged };
+}
+
+/** gzip `p` to `p.gz` (0600), then remove `p`. @param {string} p */
+async function gzipFile(p) {
+  await pipeline(createReadStream(p), createGzip(), createWriteStream(`${p}.gz`, { mode: 0o600, flags: 'wx' }));
+  await rm(p);
 }
 
 /**
  * Start the log of one guest request. Returns null when logging is off.
- * Nothing is written until `begin(unbilled)`: a billed completion (a 2xx
- * /v1/messages) is logged in full; anything that costs the guest nothing (a
- * refusal here, an error status from upstream, count_tokens, models) keeps
- * the first 64 KB of its body and only up to unbilledPerDay /
- * unbilledBytesPerDay per guest per UTC day, after which it is only counted. `chunk` takes response bytes as they arrive
- * (held until begin), `end(status)` begins if needed and closes the file. The
- * body is written as the raw bytes received.
+ * Nothing is written until `begin(unbilled)`, which the caller awaits BEFORE
+ * forwarding: 'logged' (go on), 'counted' (an unbilled request over its daily
+ * cap: only counted, go on) or 'failed' (cannot be logged: refuse it). A
+ * billed completion keeps its whole body; an unbilled one (refused here,
+ * count_tokens, models) its first 64 KB. `chunk` takes response bytes,
+ * `end(status)` closes the entry: meta written, every file gzipped, `.done`
+ * last. `finished` settles when that is done (or given up).
  * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
  *   presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
- * @returns {{begin: (unbilled: boolean) => void, chunk: (b: Buffer) => void, end: (status?: number, unbilled?: boolean) => void, reqPath: string, resPath: string, metaPath: string}|null}
+ * @returns {{begin: (unbilled: boolean) => Promise<'logged'|'counted'|'failed'>, chunk: (b: Buffer) => void, end: (status?: number) => void, finished: Promise<void>, reqPath: string, resPath: string, metaPath: string, donePath: string}|null}
  */
 export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
   if (!guestLogsEnabled(config)) return null;
@@ -215,7 +251,9 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   const reqPath = join(dir, `${stem}.req.json`);
   const metaPath = join(dir, `${stem}.meta.json`);
   const resPath = join(dir, `${stem}.res.sse`);
+  const donePath = join(dir, `${stem}.done`);
   const cleanHeaders = sanitizeHeaders(headers, presentedKey);
+  const guestMax = guestMaxBytesOf(config);
 
   let failed = false;
   const fail = (/** @type {any} */ err) => {
@@ -225,82 +263,118 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
     const t = Date.now();
     if (t - lastFailLog < 60_000) return;
     lastFailLog = t;
-    try { log(`[TeamClaude] guest ${guest}: stream log write failed (${err?.code || err?.message || err}); the request goes on`); } catch { /* nothing */ }
+    try { log(`[TeamClaude] guest ${guest}: stream log write failed (${err?.code || err?.message || err})`); } catch { /* nothing */ }
   };
 
   /** @type {Buffer[]} */
   let queue = [];
   let queued = 0;
-  let begun = false;
-  let dead = false;      // not logging this request (budget, unbilled cap, write error)
+  let dead = false;      // nothing more is written (a budget ran out, a write failed)
   let ended = false;
-  /** @type {ReturnType<typeof unbilledOf>|null} */
-  let unbilledQ = null;
+  /** @type {string|null} why the answer was cut short in the log */
+  let cutShort = null;
+  let isUnbilled = false;
+  let truncatedFrom = 0;
+  /** @type {number|undefined} */
+  let endStatus;
+  /** @type {DayCounters|null} */
+  let q = null;
   /** @type {import('node:fs').WriteStream|null} */
   let stream = null;
+  /** @type {Promise<'logged'|'counted'|'failed'>|null} */
+  let begun = null;
+  /** @type {(v?: any) => void} */
+  let settle = () => {};
+  const finished = new Promise(r => { settle = r; });
 
   const write = (/** @type {Buffer} */ b) => {
-    // An unbilled request's answer counts against the guest's unbilled bytes too.
-    if (unbilledQ) {
-      if (unbilledQ.bytes + b.length > GUEST_LOG_DEFAULTS.unbilledBytesPerDay) { dead = true; stream?.end(); return; }
-      unbilledQ.bytes += b.length;
-      saveUnbilled(unbilledQ);
-    }
-    // The answer counts against the size budget; past it the file stops here.
-    if (!spend(config, base, b.length, log)) { dead = true; stream?.end(); return; }
-    if (stream) { stream.write(b); return; }
-    if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
-    queue.push(b);
-    queued += b.length;
+    if (dead || !q) return;
+    if (q.allBytes + b.length > guestMax) { cutShort = 'guest daily log budget'; dead = true; return; }
+    if (isUnbilled && q.unbilledBytes + b.length > GUEST_LOG_DEFAULTS.unbilledBytesPerDay) { cutShort = 'unbilled daily cap'; dead = true; return; }
+    if (!spend(config, base, b.length, log)) { cutShort = 'logMaxMB'; dead = true; return; }
+    q.allBytes += b.length;
+    if (isUnbilled) q.unbilledBytes += b.length;
+    saveDay(q);
+    stream?.write(b);
+  };
+
+  const finalize = async () => {
+    try {
+      if (stream) { stream.end(); if (!stream.closed) await once(stream, 'close'); }
+      if (failed) return;
+      const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, status: endStatus ?? null,
+        ...(isUnbilled || Number(endStatus) >= 400 ? { unbilled: true } : {}),
+        ...(truncatedFrom ? { bodyTruncatedFrom: truncatedFrom } : {}),
+        ...(cutShort ? { answerCutShort: cutShort } : {}),
+        headers: cleanHeaders });
+      await writeFile(metaPath, meta, { mode: 0o600, flag: 'wx' });
+      for (const p of [reqPath, resPath, metaPath]) await gzipFile(p);
+      await writeFile(`${donePath}.tmp`, `${new Date().toISOString()}\n`, { mode: 0o600 });
+      await rename(`${donePath}.tmp`, donePath);
+    } catch (err) { fail(err); } finally { settle(); }
   };
 
   const begin = (/** @type {boolean} */ unbilled) => {
-    if (begun) return;
-    begun = true;
-    const held = queue;
-    queue = []; queued = 0;
-    const cut = unbilled && body.length > GUEST_LOG_DEFAULTS.unbilledBodyBytes;
-    const reqBody = cut ? body.subarray(0, GUEST_LOG_DEFAULTS.unbilledBodyBytes) : body;
-    const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, ...(unbilled ? { unbilled: true } : {}),
-      ...(cut ? { bodyTruncatedFrom: body.length } : {}), headers: cleanHeaders });
-    const size = reqBody.length + meta.length;
-    if (unbilled) {
-      const q = unbilledOf(dir, day);
-      saveUnbilled(q);
-      if (q.entries >= GUEST_LOG_DEFAULTS.unbilledPerDay || q.bytes + size > GUEST_LOG_DEFAULTS.unbilledBytesPerDay) {
+    if (begun) return begun;
+    begun = (async () => {
+      q = dayOf(dir, day);
+      await q.ready;
+      isUnbilled = unbilled;
+      const cut = unbilled && body.length > GUEST_LOG_DEFAULTS.unbilledBodyBytes;
+      const reqBody = cut ? body.subarray(0, GUEST_LOG_DEFAULTS.unbilledBodyBytes) : body;
+      if (cut) truncatedFrom = body.length;
+      const size = reqBody.length + 4096;   // + the meta written at the end
+      if (unbilled && (q.unbilledEntries >= GUEST_LOG_DEFAULTS.unbilledPerDay || q.unbilledBytes + size > GUEST_LOG_DEFAULTS.unbilledBytesPerDay)) {
         q.notLogged += 1;
+        saveDay(q);
         dead = true;
-        return;
+        settle();
+        return 'counted';
       }
-      q.entries += 1;
-      q.bytes += size;
-      unbilledQ = q;
-    }
-    if (!spend(config, base, size, log)) { dead = true; return; }
-    for (const b of held) { if (dead) break; write(b); }
-    mkdir(dir, { recursive: true, mode: 0o700 })
-      .then(() => writeFile(metaPath, meta, { mode: 0o600, flag: 'wx' }))
-      .then(() => writeFile(reqPath, reqBody, { mode: 0o600, flag: 'wx' }))
-      .then(() => {
-        if (failed) return;
-        stream = createWriteStream(resPath, { mode: 0o600, flags: 'wx' });
-        stream.on('error', fail);
-        for (const b of queue) stream.write(b);
-        queue = [];
-        if (ended || dead) stream.end();
-      })
-      .catch(fail);
+      if (q.allBytes + size > guestMax) {
+        if (!q.fullLogged) {
+          q.fullLogged = true;
+          try { log(`[TeamClaude] guest ${guest}: daily log budget (guests.logGuestMBPerDay, ${Math.round(guestMax / 1048576)} MB) spent; its requests are refused until 00:00 UTC`); } catch { /* nothing */ }
+        }
+        dead = true; settle(); return 'failed';
+      }
+      if (!spend(config, base, size, log)) { dead = true; settle(); return 'failed'; }
+      q.allBytes += size;
+      if (unbilled) { q.unbilledEntries += 1; q.unbilledBytes += size; }
+      saveDay(q);
+      try {
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        await writeFile(reqPath, reqBody, { mode: 0o600, flag: 'wx' });
+        const ws = createWriteStream(resPath, { mode: 0o600, flags: 'wx' });
+        await once(ws, 'open');
+        ws.on('error', fail);
+        stream = ws;
+      } catch (err) {
+        fail(err);
+        dead = true;
+        settle();
+        return 'failed';
+      }
+      // Bytes that came while the file was opening: booked and written now.
+      const held = queue;
+      queue = []; queued = 0;
+      for (const b of held) write(b);
+      return 'logged';
+    })();
+    return begun;
   };
 
   return {
     reqPath,
     resPath,
     metaPath,
+    donePath,
+    finished,
     begin,
     chunk(b) {
       if (failed || ended || dead || !b?.length) return;
-      if (!begun) {
-        // Held until the status says how to log it; bounded like the open queue.
+      if (!stream) {
+        // Not open yet: held (bounded) until begin settles.
         if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
         queue.push(Buffer.from(b));
         queued += b.length;
@@ -308,46 +382,53 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
       }
       write(Buffer.from(b));
     },
-    end(status, unbilled = false) {
+    end(status) {
       if (ended) return;
-      if (!begun) begin(unbilled || Number(status) >= 400);
       ended = true;
-      if (stream) stream.end();
+      endStatus = status;
+      if (!begun) { settle(); return; }
+      begun.then(r => { if (r === 'logged' && stream) finalize(); });
     },
   };
 }
 
-/** @param {string} p @returns {Promise<number>} */
-async function dirBytes(p) {
-  let n = 0;
-  let entries;
-  try { entries = await readdir(p, { withFileTypes: true }); } catch { return 0; }
-  for (const e of entries) {
-    const f = join(p, e.name);
-    if (e.isFile() && LOG_FILE_RE.test(e.name)) { try { n += (await stat(f)).size; } catch { /* gone */ } }
+/**
+ * The entries of one day folder: this module's files grouped by stem, with
+ * their size and whether the shipper has marked them shipped. day.json and
+ * anything foreign are not entries.
+ * @param {string} path
+ * @returns {Promise<{entries: {stem: string, files: string[], bytes: number, shipped: boolean}[], dayFileBytes: number}>}
+ */
+async function scanDay(path) {
+  /** @type {Map<string, {stem: string, files: string[], bytes: number, shipped: boolean}>} */
+  const by = new Map();
+  let dayFileBytes = 0;
+  let list;
+  try { list = await readdir(path, { withFileTypes: true }); } catch { return { entries: [], dayFileBytes }; }
+  for (const e of list) {
+    if (!e.isFile() || !LOG_FILE_RE.test(e.name)) continue;
+    let size = 0;
+    try { size = (await stat(join(path, e.name))).size; } catch { continue; }
+    if (e.name === DAY_FILE) { dayFileBytes = size; continue; }
+    const stem = /** @type {RegExpExecArray} */ (STEM_RE.exec(e.name))[1];
+    let en = by.get(stem);
+    if (!en) { en = { stem, files: [], bytes: 0, shipped: false }; by.set(stem, en); }
+    en.files.push(e.name);
+    en.bytes += size;
+    if (e.name.endsWith('.shipped')) en.shipped = true;
   }
-  return n;
+  return { entries: [...by.values()], dayFileBytes };
 }
 
-/**
- * Delete this module's files in one day folder, then the folder if empty.
- * Nothing else in it (or anywhere) is touched.
- * @param {string} path
- */
-async function removeDay(path) {
+/** Delete one entry's files: the bytes that went, and whether all did. @param {string} path @param {{files: string[]}} en */
+async function removeEntry(path, en) {
   let freed = 0;
-  let entries;
-  try { entries = await readdir(path, { withFileTypes: true }); } catch { return { freed, gone: false }; }
-  for (const e of entries) {
-    if (!e.isFile() || !LOG_FILE_RE.test(e.name)) continue;
-    const f = join(path, e.name);
-    try {
-      const size = (await stat(f)).size;
-      await rm(f);
-      freed += size;
-    } catch { /* not ours to remove after all */ }
+  let all = true;
+  for (const f of en.files) {
+    const p = join(path, f);
+    try { const size = (await stat(p)).size; await rm(p); freed += size; } catch { all = false; /* could not remove it */ }
   }
-  try { await rmdir(path); return { freed, gone: true }; } catch { return { freed, gone: false }; /* foreign files stay */ }
+  return { freed, all };
 }
 
 // Size backstop with a gap: past HIGH of logMaxMB a prune frees down to LOW,
@@ -357,58 +438,82 @@ export const PRUNE_HIGH = 0.9;
 export const PRUNE_LOW = 0.8;
 
 /**
- * Remove day folders older than retentionDays; then, when the whole log is
- * over 90% of maxMB, the oldest days until it is at most 80%. Today's folders
- * are kept unless today alone is over maxMB: then logging pauses for the day
- * (the budget) instead of erasing what today's requests did. Only folders named as guestDirName names them (a
- * removed guest's too), only YYYY-MM-DD folders in them, only this module's
- * own files, never through a symlink, so a mistaken logDir (~, /) can never
- * lose anything else.
+ * Free local space. Shipped entries older than retentionDays go. Then, when
+ * the whole log is over 90% of maxMB, entries until it is at most 80%:
+ * shipped ones first (oldest first, any day), then unshipped ones (oldest
+ * first; today's only when today alone is over maxMB), which the caller
+ * reports loudly. A past day left with no entries loses its day.json and
+ * folder. Only folders named as guestDirName names them (a removed guest's
+ * too), only YYYY-MM-DD folders in them, only this module's own files (and
+ * the shipper's .shipped), never through a symlink, so a mistaken logDir (~,
+ * /) can never lose anything else.
  * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number}} o
- * @returns {Promise<{removed: string[], bytes: number, freed: number}>}
+ * @returns {Promise<{removed: string[], unshippedRemoved: number, bytes: number, freed: number}>}
  */
 export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now() }) {
   /** @type {string[]} */
   const removed = [];
-  /** @type {{path: string, day: string, bytes: number}[]} */
-  const days = [];
-  let entries;
+  let unshippedRemoved = 0;
   let freed = 0;
-  /** Remove a day's files; the bytes that actually went. @param {string} path */
-  const drop = async (path) => {
-    const r = await removeDay(path);
-    freed += r.freed;
-    if (r.gone) removed.push(path);
-    return r.freed;
-  };
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0, freed }; }
+  /** @type {{path: string, day: string, en: {stem: string, files: string[], bytes: number, shipped: boolean}}[]} */
+  const all = [];
+  /** @type {{path: string, day: string}[]} */
+  const dayDirs = [];
+  let bytes = 0;
+  let guests;
+  try { guests = await readdir(dir, { withFileTypes: true }); } catch { return { removed, unshippedRemoved, bytes: 0, freed }; }
+  const today = new Date(now).toISOString().slice(0, 10);
   const cutoff = new Date(now - retentionDays * 86_400_000).toISOString().slice(0, 10);
-  for (const g of entries) {
+  for (const g of guests) {
     if (!g.isDirectory() || guestDirName(g.name) !== g.name) continue;
     let ds;
     try { ds = await readdir(join(dir, g.name), { withFileTypes: true }); } catch { continue; }
     for (const d of ds) {
       if (!d.isDirectory() || !DAY_RE.test(d.name)) continue;
       const path = join(dir, g.name, d.name);
-      if (d.name < cutoff) { await drop(path); continue; }
-      days.push({ path, day: d.name, bytes: await dirBytes(path) });
+      dayDirs.push({ path, day: d.name });
+      const { entries, dayFileBytes } = await scanDay(path);
+      bytes += dayFileBytes;
+      for (const en of entries) all.push({ path, day: d.name, en });
     }
   }
-  let bytes = days.reduce((s, d) => s + d.bytes, 0);
+  const drop = async (/** @type {typeof all[number]} */ x) => {
+    const r = await removeEntry(x.path, x.en);
+    freed += r.freed;
+    bytes -= r.freed;
+    // Listed (and reported) only when it really went.
+    if (r.all) {
+      removed.push(join(x.path, x.en.stem));
+      if (!x.en.shipped) unshippedRemoved += 1;
+      x.en.files = [];
+    }
+  };
+  const byAge = (/** @type {typeof all[number]} */ a, /** @type {typeof all[number]} */ b) =>
+    (a.day < b.day ? -1 : a.day > b.day ? 1 : a.en.stem < b.en.stem ? -1 : a.en.stem > b.en.stem ? 1 : 0);
+  /** @type {typeof all} */
+  const kept = [];
+  for (const x of all) {
+    if (x.en.shipped && x.day < cutoff) { bytes += x.en.bytes; await drop(x); } else { bytes += x.en.bytes; kept.push(x); }
+  }
   const limit = maxMB * 1024 * 1024;
   if (bytes > limit * PRUNE_HIGH) {
-    const today = new Date(now).toISOString().slice(0, 10);
-    const todays = days.filter(d => d.day >= today);
-    const todayBytes = todays.reduce((s, d) => s + d.bytes, 0);
-    // Oldest first; today's only when today alone is over the cap.
-    const order = days.filter(d => d.day < today).sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
-    if (todayBytes > limit) order.push(...todays);
-    for (const d of order) {
-      if (bytes <= limit * PRUNE_LOW) break;
-      bytes -= await drop(d.path);
+    const shipped = kept.filter(x => x.en.shipped).sort(byAge);
+    for (const x of shipped) { if (bytes <= limit * PRUNE_LOW) break; await drop(x); }
+    if (bytes > limit * PRUNE_LOW) {
+      const todayBytes = kept.filter(x => x.day >= today && x.en.files.length).reduce((s, x) => s + x.en.bytes, 0);
+      const unshipped = kept.filter(x => !x.en.shipped && x.en.files.length && (x.day < today || todayBytes > limit)).sort(byAge);
+      for (const x of unshipped) { if (bytes <= limit * PRUNE_LOW) break; await drop(x); }
     }
   }
-  return { removed, bytes, freed };
+  // A past day with no entries left: its counters and folder go too.
+  for (const d of dayDirs) {
+    if (d.day >= today) continue;
+    const { entries, dayFileBytes } = await scanDay(d.path);
+    if (entries.length) continue;
+    if (dayFileBytes) { try { await rm(join(d.path, DAY_FILE)); bytes -= dayFileBytes; freed += dayFileBytes; } catch { /* gone */ } }
+    try { await rmdir(d.path); } catch { /* foreign files stay */ }
+  }
+  return { removed, unshippedRemoved, bytes: Math.max(0, bytes), freed };
 }
 
 /** @type {Set<string>} dirs with a prune running */
@@ -431,7 +536,11 @@ export function runGuestLogPrune(config, log = console.log) {
     .then(r => {
       // Still full after a prune that freed nothing: stay quiet about it.
       setGuestLogBytes(dir, r.bytes, { keepFull: r.freed === 0 && r.bytes >= maxBytesOf(config) * PRUNE_HIGH });
-      if (r.removed.length) log(`[TeamClaude] guest logs: pruned ${r.removed.length} day folder(s)`);
+      const shippedGone = r.removed.length - r.unshippedRemoved;
+      if (shippedGone) log(`[TeamClaude] guest logs: pruned ${shippedGone} shipped entr${shippedGone === 1 ? 'y' : 'ies'}`);
+      if (r.unshippedRemoved) {
+        log(`[TeamClaude] guest logs: WARNING deleted ${r.unshippedRemoved} UNSHIPPED entr${r.unshippedRemoved === 1 ? 'y' : 'ies'} (oldest first) to stay under guests.logMaxMB: the shipper is behind or not running, those logs are gone`);
+      }
     })
     .catch(err => { try { log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`); } catch { /* nothing */ } })
     .finally(() => pruning.delete(dir));
@@ -509,51 +618,63 @@ export function parseGuestAnswer(raw) {
   return { text, tools, usage, model, error };
 }
 
+/** A log file's text, from `<p>.gz` or plain `<p>` (an entry still running). @param {string} p */
+async function readLogText(p) {
+  try { return gunzipSync(await readFile(`${p}.gz`)).toString('utf8'); } catch { /* not gzipped (yet) */ }
+  try { return await readFile(p, 'utf8'); } catch { return ''; }
+}
+
 /**
- * A readable transcript of one guest's day, oldest request first.
+ * A readable transcript of one guest's day, oldest request first. Everything
+ * in it came from the guest or the model, so every field is stripped of
+ * escape sequences and control / bidi characters (sanitizeMultiline) before
+ * it reaches a terminal or an agent.
  * @param {{dir: string, guest: string, date?: string|null}} o
  * @returns {Promise<string>}
  */
 export async function renderGuestTranscript({ dir, guest, date = null }) {
+  const name = safeGuestLine(guest, 64);
   const gdir = join(dir, guestDirName(guest));
   let days;
   try { days = (await readdir(gdir)).filter(d => DAY_RE.test(d)).sort(); } catch { days = []; }
-  if (!days.length) return `No logs for guest "${guest}" in ${gdir}.`;
+  if (!days.length) return `No logs for guest "${name}" in ${safeGuestLine(gdir, 300)}.`;
   const day = date || days[days.length - 1];
-  if (!days.includes(day)) return `No logs for guest "${guest}" on ${day}. Days with logs: ${days.slice(-10).join(', ')}`;
-  const files = (await readdir(join(gdir, day))).filter(f => f.endsWith('.req.json')).sort();
+  if (!days.includes(day)) return `No logs for guest "${name}" on ${safeGuestLine(day, 10)}. Days with logs: ${days.slice(-10).join(', ')}`;
+  const stems = [...new Set((await readdir(join(gdir, day))).filter(f => /\.req\.json(\.gz)?$/.test(f) && STEM_RE.test(f))
+    .map(f => /** @type {RegExpExecArray} */ (STEM_RE.exec(f))[1]))].sort();
   const n = (/** @type {any} */ v) => Number(v || 0).toLocaleString('en-US');
-  const out = [`Guest "${guest}", ${day} (UTC): ${files.length} request(s)`];
+  const one = (/** @type {unknown} */ v, /** @type {number} */ max = 200) => safeGuestLine(String(v ?? ''), max);
+  const multi = (/** @type {unknown} */ v, /** @type {number} */ max) => clip(sanitizeMultiline(String(v ?? '')), max);
+  const out = [`Guest "${name}", ${day} (UTC): ${stems.length} request(s)`];
   try {
-    const skipped = Number(JSON.parse(await readFile(join(gdir, day, UNBILLED_FILE), 'utf8'))?.notLogged) || 0;
+    const skipped = Number(JSON.parse(await readFile(join(gdir, day, DAY_FILE), 'utf8'))?.notLogged) || 0;
     if (skipped) out.push(`${n(skipped)} unbilled request(s) (refusals, errors, count_tokens) not logged (over the daily cap)`);
   } catch { /* none */ }
-  for (const f of files) {
-    const stem = f.slice(0, -'.req.json'.length);
+  for (const stem of stems) {
+    const p = (/** @type {string} */ ext) => join(gdir, day, `${stem}.${ext}`);
     /** @type {any} */
     let req = null;
-    try { req = JSON.parse(await readFile(join(gdir, day, `${stem}.meta.json`), 'utf8')); } catch { /* none */ }
+    try { req = JSON.parse(await readLogText(p('meta.json'))); } catch { /* none (still running) */ }
     /** @type {any} */
     let body = {};
-    try { body = JSON.parse(await readFile(join(gdir, day, f), 'utf8')); } catch { body = {}; }
+    try { body = JSON.parse(await readLogText(p('req.json'))); } catch { body = {}; }
     if (!body || typeof body !== 'object') body = {};
-    let raw = '';
-    try { raw = await readFile(join(gdir, day, `${stem}.res.sse`), 'utf8'); } catch { /* none */ }
-    const a = parseGuestAnswer(raw);
-    const time = (req?.at || '').slice(11, 19) || stem.slice(0, 6);
-    const route = String(req?.url || '').split('?')[0];
-    out.push('', `── ${time}  ${route}  ${a.model || body.model || '?'}  (${stem.split('-').pop()})`);
+    const a = parseGuestAnswer(await readLogText(p('res.sse')));
+    const time = one((req?.at || '').slice(11, 19) || stem.slice(0, 6), 8);
+    const route = one(String(req?.url || '').split('?')[0], 80);
+    out.push('', `── ${time}  ${route}  ${one(a.model || body.model || '?', 80)}${req?.status ? `  ${one(req.status, 3)}` : ''}  (${stem.split('-').pop()})`);
     const msgs = Array.isArray(body.messages) ? body.messages : [];
     const lastUser = [...msgs].reverse().find((/** @type {any} */ m) => m?.role === 'user');
-    if (lastUser) out.push(`USER: ${clip(textOf(lastUser.content), 2000) || '(no text)'}`);
+    if (lastUser) out.push(`USER: ${multi(textOf(lastUser.content), 2000) || '(no text)'}`);
     if (req?.bodyTruncatedFrom) out.push(`(unbilled request, body ${n(req.bodyTruncatedFrom)} bytes, first 64 KB kept)`);
-    if (a.error) out.push(`ERROR: ${clip(a.error, 500)}`);
-    if (a.text) out.push(`ASSISTANT: ${clip(a.text, 4000)}`);
-    if (a.tools.length) out.push(`TOOLS: ${a.tools.join(', ')}`);
+    if (req?.answerCutShort) out.push(`(answer log cut short: ${one(req.answerCutShort, 40)})`);
+    if (a.error) out.push(`ERROR: ${multi(a.error, 500)}`);
+    if (a.text) out.push(`ASSISTANT: ${multi(a.text, 4000)}`);
+    if (a.tools.length) out.push(`TOOLS: ${a.tools.map(t => one(t, 64)).join(', ')}`);
     const u = a.usage;
     if (Object.keys(u).length) {
       out.push(`TOKENS: in ${n(u.input_tokens)} · cache write ${n(u.cache_creation_input_tokens)} · cache read ${n(u.cache_read_input_tokens)} · out ${n(u.output_tokens)}`
-        + (u.server_tool_use?.web_search_requests ? ` · web searches ${u.server_tool_use.web_search_requests}` : ''));
+        + (u.server_tool_use?.web_search_requests ? ` · web searches ${n(u.server_tool_use.web_search_requests)}` : ''));
     }
   }
   return out.join('\n');

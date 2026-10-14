@@ -12,6 +12,7 @@ import { open } from 'node:fs/promises';
 import { atomicConfigUpdate, loadConfig } from './config.js';
 import { hashGuestKey, newGuestKey, guestHostProblem, guestCap, guestPct, GUEST_DEFAULTS } from './guest.js';
 import { guestLogDir, renderGuestTranscript } from './guest-log.js';
+import { safeLine } from './safe-text.js';
 
 export const GUEST_USAGE = `Usage:
   teamclaude guest list [--json]
@@ -127,6 +128,30 @@ async function fetchLiveGuests(config) {
   } catch { return null; }
 }
 
+/**
+ * After a reload, check what the RUNNING server now does for `name` (its
+ * /teamclaude/status), not what the config file says: `want` is the state it
+ * must report ('disabled', 'enabled' or 'absent'). A server that is running but
+ * cannot show it, or shows something else, is a failure (exit 1).
+ * @param {any} config @param {string} name @param {'disabled'|'enabled'|'absent'} want
+ * @param {'reloaded'|'no-server'|'failed'} reload
+ */
+async function confirmLive(config, name, want, reload) {
+  if (reload !== 'reloaded') return;
+  const live = await fetchLiveGuests(config);
+  if (!live || !Array.isArray(live.keys)) {
+    fail(`The running server did not report its guest keys after the reload: "${name}" is NOT confirmed ${want}. Run 'teamclaude guest list' or restart the service.`);
+    return;
+  }
+  const k = live.keys.find((/** @type {any} */ x) => x?.name === name);
+  const got = !k ? 'absent' : k.enabled === false ? 'disabled' : 'enabled';
+  if (got !== want && !(want === 'disabled' && got === 'absent')) {
+    fail(`The running server still reports guest "${name}" as ${got} (wanted ${want}). It is NOT off/changed yet: restart the service.`);
+    return;
+  }
+  console.log(`Confirmed on the running server: "${name}" is ${got}.`);
+}
+
 /** @param {any} config @param {string} name @returns {any} */
 function findKey(config, name) {
   return (config.guests?.keys || []).find((/** @type {any} */ k) => k?.name === name) || null;
@@ -161,7 +186,10 @@ export async function guestCommand(argv) {
           const u = live?.keys?.find((/** @type {any} */ l) => l.name === k.name) || {};
           const cap = guestCap(k);
           return {
-            name: k.name, account: k.account, enabled: k.enabled !== false,
+            // The running server's view when it answers (L2), else the file.
+            name: k.name, account: k.account, enabled: typeof u.enabled === 'boolean' ? u.enabled : k.enabled !== false,
+            weekSharePct: u.weekSharePct ?? null, weeklyCapPct: u.weeklyCapPct ?? null, weeklyLocked: u.weeklyLocked ?? null,
+            paused: u.paused ?? null, pause5hPct: u.pause5hPct ?? null,
             dailyTokenCap: cap === Infinity ? 'unlimited' : cap,
             capPct: guestPct(k, config.guests),
             sharePct: u.sharePct ?? null, shareStale: u.shareStale ?? null, locked: u.locked ?? null,
@@ -182,8 +210,10 @@ export async function guestCommand(argv) {
           const share = r.tokensToday == null ? '?' : r.sharePct == null ? 'n/a (no fresh weekly reading)' : `${r.sharePct.toFixed(1)}%`;
           const today = r.tokensToday == null ? 'server not reachable' : `${r.tokensToday.toLocaleString('en-US')}/${backstop} backstop tokens, ${r.requestsToday} req today`;
           const locked = r.locked == null ? '?' : r.locked ? 'LOCKED until 00:00 UTC' : 'no';
-          console.log(`  ${r.name}  ${r.enabled ? 'enabled ' : 'DISABLED'}  → ${r.account}`);
+          const week = r.weekSharePct == null ? '?' : `${Number(r.weekSharePct).toFixed(1)}% / cap ${r.weeklyCapPct}%${r.weeklyLocked ? ' (LIMIT REACHED)' : ''}`;
+          console.log(`  ${safeLine(r.name, 64)}  ${r.enabled ? 'enabled ' : 'DISABLED'}  → ${safeLine(r.account, 120)}`);
           console.log(`      share today ${share} of weekly / cap ${r.capPct}%   locked ${locked}`);
+          console.log(`      this weekly window ${week}   ${r.paused ? `PAUSED (account 5h over ${r.pause5hPct}%)` : 'not paused'}`);
           console.log(`      ${today}   last seen ${r.lastSeen || 'never'}`);
         }
         return;
@@ -232,7 +262,7 @@ export async function guestCommand(argv) {
         });
         if (!config) return;
         console.log(`Guest "${name}" ${sub}d${flags.rotate ? ' and its key destroyed' : ''}.`);
-        await notifyRunningServer(config);
+        await confirmLive(config, name, sub === 'enable' ? 'enabled' : 'disabled', await notifyRunningServer(config));
         return;
       }
       case 'cap': {
@@ -274,7 +304,7 @@ export async function guestCommand(argv) {
         });
         if (!found) return fail(`No guest key named "${name}".`);
         console.log(`Removed guest "${name}".`);
-        await notifyRunningServer(config);
+        await confirmLive(config, name, 'absent', await notifyRunningServer(config));
         return;
       }
       case 'listen': {

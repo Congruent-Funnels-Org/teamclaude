@@ -56,6 +56,8 @@ export const GUEST_DEFAULTS = {
   requestsPerMinute: 240,    // per key, every allowed route (count_tokens too)
   dailyTokenCap: 100_000_000, // runaway backstop, raw tokens per UTC day
   dailyWeeklyPct: 30,        // the real limit: % of the pinned account's weekly quota per UTC day
+  weeklyPct: 60,             // and per weekly window (the account's current 7 days)
+  pause5hPct: 80,            // paused while the account's 5-hour window is past this
   weeklyStaleMs: 15 * 60_000, // an older weekly reading is not acted on (backstop only)
   maxBodyBytes: 8 * 1024 * 1024,
   maxConnections: 16,        // whole listener
@@ -181,23 +183,87 @@ export function guestPct(key, guests) {
   return GUEST_DEFAULTS.dailyWeeklyPct;
 }
 
-// Relative prices (input = 1): cache write 1.25 (1h writes 2), cache read 0.1,
-// output 5 — the same ratio on every current model. Both sides of the guest's
-// share are weighed with this one function.
-const W_CACHE_WRITE = 1.25, W_CACHE_WRITE_1H = 2, W_CACHE_READ = 0.1, W_OUTPUT = 5;
+/**
+ * A per-key % knob: the key's value, else guests.<field>, else the default.
+ * @param {any} key @param {any} guests @param {'weeklyPct'|'pause5hPct'} field
+ */
+function pctKnob(key, guests, field) {
+  for (const v of [key?.[field], guests?.[field]]) {
+    const n = Number(v);
+    if (v != null && Number.isFinite(n) && n > 0 && n <= 100) return n;
+  }
+  return GUEST_DEFAULTS[field];
+}
+/** % of the weekly quota a guest may use per weekly window. @param {any} key @param {any} [guests] */
+export const guestWeeklyPct = (key, guests) => pctKnob(key, guests, 'weeklyPct');
+/** The account 5-hour utilization (%) above which a guest is paused. @param {any} key @param {any} [guests] */
+export const guestPause5hPct = (key, guests) => pctKnob(key, guests, 'pause5hPct');
 
 /**
- * Cost-weighted tokens of one message's usage (Anthropic field names).
- * @param {any} usage
+ * The weekly window a guest's ceiling is summed over: the account's current
+ * 7 days when its weekly reset time is known and ahead, else the rolling last
+ * 7 UTC days. startDay is the first UTC day counted; retryAfter is when the
+ * window (or, rolling, its oldest day) moves on.
+ * @param {unknown} resetAt ms @param {number} [now]
+ */
+export function weeklyWindow(resetAt, now = Date.now()) {
+  const r = Number(resetAt);
+  if (Number.isFinite(r) && r > now) {
+    return { startDay: utcDay(r - 7 * 86_400_000), retryAfter: Math.max(1, Math.ceil((r - now) / 1000)),
+      resetText: `at ${new Date(r).toISOString().slice(0, 16).replace('T', ' ')} UTC` };
+  }
+  return { startDay: utcDay(now - 6 * 86_400_000), retryAfter: secondsToUtcMidnight(now), resetText: 'at 00:00 UTC' };
+}
+
+/**
+ * The ONE price table both sides of a guest's share are weighed with: US$
+ * per million tokens (Anthropic API list prices, 2026-10): input, output,
+ * cache read. Cache writes are 1.25 × input (2 × for 1h writes). Matched on
+ * the model id's start, first match wins; an unknown model is priced as the
+ * most expensive one, so a guest can never look cheaper than he is.
+ */
+export const MODEL_PRICES = [
+  { prefix: 'claude-fable-', input: 10, output: 50, cacheRead: 0.25 },
+  { prefix: 'claude-mythos-', input: 10, output: 50, cacheRead: 0.25 },
+  { prefix: 'claude-opus-5-5', input: 4, output: 20, cacheRead: 0.2 },
+  { prefix: 'claude-opus-5', input: 5, output: 25, cacheRead: 0.5 },
+  { prefix: 'claude-opus-4-8', input: 5, output: 25, cacheRead: 0.5 },
+  { prefix: 'claude-opus-4-7', input: 5, output: 25, cacheRead: 0.5 },
+  { prefix: 'claude-opus-4-6', input: 5, output: 25, cacheRead: 0.5 },
+  { prefix: 'claude-opus-4-5', input: 5, output: 25, cacheRead: 0.5 },
+  { prefix: 'claude-opus-4', input: 15, output: 75, cacheRead: 1.5 },
+  { prefix: 'claude-sonnet-5', input: 2, output: 10, cacheRead: 0.2 },
+  { prefix: 'claude-sonnet-4', input: 3, output: 15, cacheRead: 0.3 },
+  { prefix: 'claude-haiku-5', input: 0.1, output: 0.5, cacheRead: 0.01 },
+  { prefix: 'claude-haiku-4', input: 1, output: 5, cacheRead: 0.1 },
+  { prefix: 'claude-3-5-haiku', input: 0.8, output: 4, cacheRead: 0.08 },
+];
+const MOST_EXPENSIVE = MODEL_PRICES.reduce((a, b) => (b.output > a.output ? b : a));
+// A web search is billed per request: $10 per 1000.
+export const WEB_SEARCH_USD = 0.01;
+
+/** @param {unknown} model */
+export function modelPrice(model) {
+  const id = String(model ?? '').toLowerCase().replace(/^.*\//, '').replace(/\[.*\]$/, '');
+  return MODEL_PRICES.find(p => id.startsWith(p.prefix)) || MOST_EXPENSIVE;
+}
+
+/**
+ * What one message's usage cost, in micro-US$ (Anthropic field names), priced
+ * by its model, web searches included. Both sides of a guest's share use it.
+ * @param {any} usage @param {unknown} [model]
  * @returns {number}
  */
-export function weighTokens(usage) {
+export function weighTokens(usage, model) {
   if (!usage || typeof usage !== 'object') return 0;
   const n = (/** @type {unknown} */ v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+  const p = modelPrice(model);
   const write = n(usage.cache_creation_input_tokens);
   const write1h = Math.min(write, n(usage.cache_creation?.ephemeral_1h_input_tokens));
-  return n(usage.input_tokens) + (write - write1h) * W_CACHE_WRITE + write1h * W_CACHE_WRITE_1H
-    + n(usage.cache_read_input_tokens) * W_CACHE_READ + n(usage.output_tokens) * W_OUTPUT;
+  const usd = (n(usage.input_tokens) * p.input + (write - write1h) * p.input * 1.25 + write1h * p.input * 2
+    + n(usage.cache_read_input_tokens) * p.cacheRead + n(usage.output_tokens) * p.output) / 1e6
+    + n(usage.server_tool_use?.web_search_requests) * WEB_SEARCH_USD;
+  return usd * 1e6;
 }
 
 /** @param {any} key @param {'maxConcurrent'|'requestsPerMinute'} field */
@@ -289,7 +355,7 @@ export const GUEST_BETAS = new Set([
   'redact-thinking-2026-02-12', 'thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18',
   'thinking-resumption-2026-07-17', 'thinking-token-count-2026-05-13', 'mid-conversation-system-2026-04-07',
   'mid-conversation-system-clear-at-2026-08-21', 'mid-conversation-tool-changes-2026-07-01', 'per-turn-control-2026-07-01',
-  'timing-2026-09-09', 'cache-diagnosis-2026-04-07', 'inline-tools-2026-09-15', 'extended-cache-ttl-2025-04-11',
+  'timing-2026-09-09', 'inline-tools-2026-09-15', 'extended-cache-ttl-2025-04-11',
   'advanced-tool-use-2025-11-20', 'web-search-2025-03-05', 'web-fetch-2025-09-10',
 ]);
 
@@ -333,7 +399,7 @@ export function isAllowedGuestTool(t) {
  * bytes), unparseable JSON, a missing / non-positive / absurd max_tokens, and
  * server-side tools other than web search / fetch, or MCP servers.
  * @param {string} pathname @param {Record<string, any>} headers @param {Buffer} body
- * @returns {{ ok: true, estimate: number, inputEstimate: number, maxTokens: number } | { ok: false, status: number, type: string, message: string }}
+ * @returns {{ ok: true, estimate: number, inputEstimate: number, maxTokens: number, model?: string|null } | { ok: false, status: number, type: string, message: string }}
  */
 export function checkGuestBody(pathname, headers, body) {
   const enc = String(headers?.['content-encoding'] ?? '').trim().toLowerCase();
@@ -363,12 +429,13 @@ export function checkGuestBody(pathname, headers, body) {
     return { ok: false, status: 400, type: 'invalid_request_error', message: 'MCP servers are not available through this relay.' };
   }
   const inputEstimate = Math.ceil(body.length / 3) + mediaMinimum(json.messages) + mediaMinimum(json.system);
-  if (pathname === '/v1/messages/count_tokens') return { ok: true, estimate: inputEstimate, inputEstimate, maxTokens: 0 };
+  const model = typeof json.model === 'string' ? json.model : null;
+  if (pathname === '/v1/messages/count_tokens') return { ok: true, estimate: inputEstimate, inputEstimate, maxTokens: 0, model };
   const m = json.max_tokens;
   if (!Number.isInteger(m) || m <= 0 || m > MAX_GUEST_MAX_TOKENS) {
     return { ok: false, status: 400, type: 'invalid_request_error', message: `max_tokens must be a whole number from 1 to ${MAX_GUEST_MAX_TOKENS}.` };
   }
-  return { ok: true, estimate: inputEstimate + m, inputEstimate, maxTokens: m };
+  return { ok: true, estimate: inputEstimate + m, inputEstimate, maxTokens: m, model };
 }
 
 /**
@@ -453,7 +520,7 @@ export class GuestUsageTracker {
   constructor({ now = () => Date.now(), staleMs = GUEST_DEFAULTS.weeklyStaleMs } = {}) {
     this.now = now;
     this.staleMs = staleMs;
-    /** @type {Map<string, {day: string, requestsToday: number, tokensToday: number, weightedToday: number, lockedDay: string|null, requests: number, tokens: number, lastSeen: number|null}>} */
+    /** @type {Map<string, {day: string, requestsToday: number, tokensToday: number, weightedToday: number, lockedDay: string|null, requests: number, tokens: number, lastSeen: number|null, dayPct: Record<string, number>}>} */
     this.guests = new Map();
     /** @type {Map<string, {day: string, rise: number, weightedToday: number, lastUtil: number|null, lastResetAt: number|null, seenAt: number|null}>} */
     this.accounts = new Map();
@@ -464,7 +531,7 @@ export class GuestUsageTracker {
     const today = utcDay(this.now());
     let row = this.guests.get(name);
     if (!row) {
-      row = { day: today, requestsToday: 0, tokensToday: 0, weightedToday: 0, lockedDay: null, requests: 0, tokens: 0, lastSeen: null };
+      row = { day: today, requestsToday: 0, tokensToday: 0, weightedToday: 0, lockedDay: null, requests: 0, tokens: 0, lastSeen: null, dayPct: {} };
       this.guests.set(name, row);
     }
     if (row.day !== today) { row.day = today; row.requestsToday = 0; row.tokensToday = 0; row.weightedToday = 0; }
@@ -574,6 +641,27 @@ export class GuestUsageTracker {
     return { pct: stale ? null : rise * 100 * fraction, stale, risePct: rise * 100, guestWeighted, accountWeighted };
   }
 
+  /**
+   * Remember today's share % (the latest figure wins), for the weekly
+   * ceiling. Only the last 8 days are kept.
+   * @param {string} name @param {number} pct
+   */
+  noteDayPct(name, pct) {
+    const n = Number(pct);
+    if (!Number.isFinite(n) || n < 0) return;
+    const row = this._row(name);
+    row.dayPct[utcDay(this.now())] = n;
+    const days = Object.keys(row.dayPct).sort();
+    for (const d of days.slice(0, Math.max(0, days.length - 8))) delete row.dayPct[d];
+  }
+
+  /** The guest's share % summed over the UTC days from startDay on. @param {string} name @param {string} startDay */
+  weekPct(name, startDay) {
+    const row = this.guests.get(name);
+    if (!row) return 0;
+    return Object.entries(row.dayPct).reduce((s, [d, v]) => (d >= startDay ? s + v : s), 0);
+  }
+
   /** Lock the guest for the rest of today (UTC). @param {string} name */
   lock(name) { this._row(name).lockedDay = utcDay(this.now()); }
 
@@ -603,7 +691,7 @@ export class GuestUsageTracker {
   }
 
   export() {
-    return Object.fromEntries([...this.guests].map(([k, v]) => [k, { ...v }]));
+    return Object.fromEntries([...this.guests].map(([k, v]) => [k, { ...v, dayPct: { ...v.dayPct } }]));
   }
 
   exportAccounts() {
@@ -622,6 +710,9 @@ export class GuestUsageTracker {
           tokensToday: num(v.tokensToday),
           weightedToday: num(v.weightedToday),
           lockedDay: typeof v.lockedDay === 'string' ? v.lockedDay : null,
+          dayPct: v.dayPct && typeof v.dayPct === 'object'
+            ? Object.fromEntries(Object.entries(v.dayPct).filter(([d, x]) => /^\d{4}-\d{2}-\d{2}$/.test(d) && Number.isFinite(Number(x))).map(([d, x]) => [d, Number(x)]))
+            : {},
           requests: num(v.requests),
           tokens: num(v.tokens),
           lastSeen: Number(v.lastSeen) || null,
@@ -667,6 +758,13 @@ export function guestStatus(config, guestUsage, listening = null, accountManager
       if (idx != null) sampleWeekly(accountManager, guestUsage, idx);
       const accountName = idx != null ? accountManager.accounts[idx].name : (k.account || '');
       const sh = guestUsage.share(k.name.trim(), accountName);
+      if (sh.pct != null) guestUsage.noteDayPct(k.name.trim(), sh.pct);
+      const quota = idx != null ? (accountManager.accounts[idx].quota || {}) : {};
+      const win = weeklyWindow(quota.unified7dReset);
+      const wk = guestUsage.weekPct(k.name.trim(), win.startDay);
+      const u5 = Number(quota.unified5h);
+      const r5 = Number(quota.unified5hReset) || null;
+      const p5 = guestPause5hPct(k, config?.guests);
       const cap = guestCap(k);
       return {
         name: k.name,
@@ -677,6 +775,11 @@ export function guestStatus(config, guestUsage, listening = null, accountManager
         shareStale: sh.stale,
         capPct: guestPct(k, config?.guests),
         locked: guestUsage.lockedToday(k.name.trim()),
+        weekSharePct: Math.round(wk * 100) / 100,
+        weeklyCapPct: guestWeeklyPct(k, config?.guests),
+        weeklyLocked: wk >= guestWeeklyPct(k, config?.guests),
+        pause5hPct: p5,
+        paused: quota.unified5h != null && Number.isFinite(u5) && (r5 == null || Date.now() < r5) && u5 * 100 > p5,
         ...guestUsage.get(k.name.trim()),
       };
     }),
@@ -697,9 +800,8 @@ function sendJson(res, status, type, message, extra = {}) {
  * @param {any} res
  * @param {() => string[]} identifiers account names/emails to keep out of error text
  * @param {((b: Buffer) => void)|null} [tap] sees every body byte as the forwarder wrote it (the guest stream log)
- * @param {((status: number) => void)|null} [onStatus] told the status before any body byte
  */
-function guardResponse(res, identifiers, tap = null, onStatus = null) {
+function guardResponse(res, identifiers, tap = null) {
   const setHeader = res.setHeader.bind(res);
   res.setHeader = (/** @type {string} */ name, /** @type {any} */ value) => (isAllowedResponseHeader(name) ? setHeader(name, value) : res);
   const writeHead = res.writeHead.bind(res);
@@ -723,7 +825,6 @@ function guardResponse(res, identifiers, tap = null, onStatus = null) {
   };
   res.writeHead = (/** @type {number} */ code, /** @type {any[]} */ ...rest) => {
     status = code;
-    told(code);
     const args = rest.map(a => {
       if (!a || typeof a !== 'object') return a;
       if (Array.isArray(a)) {
@@ -744,15 +845,7 @@ function guardResponse(res, identifiers, tap = null, onStatus = null) {
   };
   const asBuffer = (/** @type {any} */ chunk, /** @type {any} */ enc) => (Buffer.isBuffer(chunk) ? chunk
     : Buffer.from(String(chunk), /** @type {BufferEncoding} */ (typeof enc === 'string' ? enc : 'utf8')));
-  let toldStatus = false;
-  const told = (/** @type {number} */ code) => {
-    if (toldStatus) return;
-    toldStatus = true;
-    try { onStatus?.(code); } catch { /* logging never fails a request */ }
-  };
   const tapped = (/** @type {any} */ chunk, /** @type {any} */ enc) => {
-    // A body written without an explicit writeHead goes out with statusCode.
-    told(res.statusCode || 200);
     if (!tap || chunk == null || typeof chunk === 'function') return;
     try { tap(asBuffer(chunk, enc)); } catch { /* logging never fails a request */ }
   };
@@ -783,7 +876,7 @@ function guardResponse(res, identifiers, tap = null, onStatus = null) {
   };
 }
 
-const CACHE_FIGURE_RE = /"(cache_read_input_tokens|cache_creation_input_tokens|ephemeral_5m_input_tokens|ephemeral_1h_input_tokens)"(\s*):(\s*)\d+/g;
+const CACHE_FIGURE_RE = /"(cache_read_input_tokens|cache_creation_input_tokens|cache_missed_input_tokens|ephemeral_5m_input_tokens|ephemeral_1h_input_tokens)"(\s*):(\s*)\d+/g;
 /** @param {string} text */
 export function zeroCacheFigures(text) {
   return text.replace(CACHE_FIGURE_RE, '"$1"$2:$30');
@@ -850,15 +943,18 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
   // share. Fed by the same per-message usage every listener records, and the
   // weekly reading sampled at the same moment (its headers came first).
   const unsubscribe = typeof accountManager?.onTokenUsage === 'function'
-    ? accountManager.onTokenUsage((/** @type {number} */ idx, /** @type {any} */ usage) => {
+    ? accountManager.onTokenUsage((/** @type {number} */ idx, /** @type {any} */ usage, /** @type {any} */ model) => {
       const a = accountManager.accounts[idx];
       if (!a) return;
       sampleWeekly(accountManager, guestUsage, idx);
-      guestUsage.recordAccountWeighted(a.name, weighTokens(usage));
+      guestUsage.recordAccountWeighted(a.name, weighTokens(usage, model));
     })
     : () => {};
   /** @type {Map<string, number>} guests whose weekly reading is stale → when that was last logged (once an hour) */
   const staleLogged = new Map();
+  /** @type {Map<string, number>} guests at their weekly ceiling → when that was last logged (once an hour) */
+  const weeklyLogged = new Map();
+  let lastLogFailLine = 0;
   const listeners = new Map(); // "name\0pin" → forwarding listener
   /** @type {Map<string, {inflight: number, reserved: number, recent: number[]}>} */
   const live = new Map();
@@ -952,6 +1048,36 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       lockedOut();
       return;
     }
+    // The weekly ceiling: the guest's share of the weekly quota summed over
+    // the account's current 7-day window (rolling 7 days when its reset time
+    // is unknown). Not a lock: it lifts as the window moves on.
+    if (sh.pct != null) guestUsage.noteDayPct(name, sh.pct);
+    const quota = accountManager.accounts[pinIndex].quota || {};
+    const win = weeklyWindow(quota.unified7dReset);
+    const wk = guestUsage.weekPct(name, win.startDay);
+    const wkCap = guestWeeklyPct(key, config.guests);
+    if (wk >= wkCap) {
+      if (Date.now() - (weeklyLogged.get(name) ?? -Infinity) >= 3_600_000) {
+        weeklyLogged.set(name, Date.now());
+        log(`[TeamClaude] guest ${name}: weekly ceiling reached (${wk.toFixed(1)}% of the weekly quota this window, cap ${wkCap}%), refused until the window moves on`);
+      }
+      sendJson(res, 429, 'rate_limit_error', `Weekly limit reached. It resets ${win.resetText}.`,
+        { 'retry-after': String(win.retryAfter), connection: 'close' });
+      req.resume?.();
+      return;
+    }
+    // The pause: while the account's 5-hour window is past pause5hPct, the
+    // guest waits so the owner's own work keeps the room. Lifts by itself.
+    const p5 = guestPause5hPct(key, config.guests);
+    const u5 = Number(quota.unified5h);
+    const r5 = Number(quota.unified5hReset) || null;
+    if (quota.unified5h != null && Number.isFinite(u5) && (r5 == null || Date.now() < r5) && u5 * 100 > p5) {
+      const wait = r5 ? Math.min(600, Math.max(30, Math.ceil((r5 - Date.now()) / 1000))) : 300;
+      sendJson(res, 429, 'rate_limit_error', 'The shared account is busy right now. Try again in a few minutes.',
+        { 'retry-after': String(wait), connection: 'close' });
+      req.resume?.();
+      return;
+    }
     if (sh.stale) {
       if (Date.now() - (staleLogged.get(name) ?? -Infinity) >= 3_600_000) {
         staleLogged.set(name, Date.now());
@@ -980,7 +1106,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
     let reservation = 0;
     let released = false;
     // What this request has booked so far, to settle a cut-short answer.
-    const booked = { input: 0, output: 0, extra: 0, final: false, forwarded: false, maxTokens: 0, inputEstimate: 0, completion: false, weighted: 0 };
+    const booked = { input: 0, output: 0, extra: 0, final: false, forwarded: false, maxTokens: 0, inputEstimate: 0, completion: false, weighted: 0, model: /** @type {string|null} */ (null) };
     /** @type {Record<string, any>} the message's usage so far, merged the way server.js merges it */
     const merged = {};
     /** @type {ReturnType<typeof openGuestLog>} */
@@ -1004,9 +1130,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       }
     };
     res.once('close', release);
-    // Only a billed completion is logged in full: everything else costs the
-    // guest nothing and goes under the unbilled cap (guest-log.js).
-    res.once('close', () => entry?.end(res.statusCode, !booked.completion));
+    // The log entry is closed (gzipped, marked .done) when the answer ends.
+    res.once('close', () => entry?.end(res.statusCode));
     /** A refusal after the body was read: answered, and kept (under the unbilled cap) in the stream log. */
     const refuse = (/** @type {number} */ status, /** @type {string} */ type, /** @type {string} */ message, /** @type {Record<string, string>} */ extra = {}) => {
       entry?.begin(true);
@@ -1021,11 +1146,10 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         req.destroy?.();
         return;
       }
-      // The request and, below, the answer as received (guest-log.js). How it
-      // is logged waits for the outcome: in full when answered, capped when
-      // refused (here or by upstream), since a refusal costs the guest nothing
-      // and must not be a way to fill the disk or push real requests out.
-      // Never blocks or fails the request.
+      // The request and, below, the answer as received (guest-log.js). A
+      // billed completion is logged in full; anything unbilled (refused here,
+      // count_tokens, models) under the unbilled cap. Logging fails CLOSED:
+      // a request that cannot be logged is refused before it is forwarded.
       entry = openGuestLog({ config, guest: name, method: req.method, url: req.url, headers: req.headers,
         body, presentedKey: presentedGuestKey(req.headers), log });
       const pathname = new URL(req.url, 'http://guest.invalid').pathname;
@@ -1035,7 +1159,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         refuse(bad.status, bad.type, bad.message);
         return;
       }
-      const good = /** @type {{estimate: number, inputEstimate: number, maxTokens: number}} */ (/** @type {unknown} */ (checked));
+      const good = /** @type {{estimate: number, inputEstimate: number, maxTokens: number, model?: string|null}} */ (/** @type {unknown} */ (checked));
+      booked.model = good.model ?? null;
       booked.maxTokens = good.maxTokens;
       booked.inputEstimate = good.inputEstimate;
       booked.completion = pathname === '/v1/messages';
@@ -1050,13 +1175,24 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         return;
       }
       state.reserved += reservation;
+      if (entry) {
+        const logged = await entry.begin(!booked.completion);
+        if (logged === 'failed') {
+          if (Date.now() - lastLogFailLine >= 60_000) {
+            lastLogFailLine = Date.now();
+            log(`[TeamClaude] guest ${name}: request refused, it could not be logged (log budget spent or not writable)`);
+          }
+          sendJson(res, 503, 'api_error', 'Logging unavailable. Try again later.', { 'retry-after': '60' });
+          return;
+        }
+      }
       for (const h of STRIPPED_REQUEST_HEADERS) delete req.headers[h];
       const pinned = accountManager.accounts[/** @type {number} */ (resolveAccountPin(accountManager, key.account.trim()))];
       const beta = guestBetas(req.headers['anthropic-beta'], { oauth: pinned?.type === 'oauth' });
       if (beta === undefined) delete req.headers['anthropic-beta'];
       else req.headers['anthropic-beta'] = beta;
       const log1 = entry;
-      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null, log1 ? (code) => log1.begin(code >= 400 || !booked.completion) : null);
+      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null);
       guestUsage.recordRequest(name);
       // The body is already read; the forwarder reads it again from this copy.
       const replay = /** @type {any} */ (Readable.from(body.length ? [body] : []));
@@ -1079,7 +1215,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         const report = raw && typeof raw === 'object' ? raw : (cumulative && typeof cumulative === 'object' ? cumulative : null);
         if (report) {
           Object.assign(merged, report);
-          const w = weighTokens(merged);
+          const w = weighTokens(merged, booked.model);
           if (w > booked.weighted) { guestUsage.recordGuestWeighted(name, w - booked.weighted); booked.weighted = w; }
         }
         const fresh = (input || 0) + (cache || 0);
@@ -1117,7 +1253,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
     try {
       await handle(req, res);
     } catch (err) {
-      log(`[TeamClaude] guest handler error: ${err instanceof Error ? err.message : String(err)}`);
+      log(`[TeamClaude] guest handler error: ${safeLine(err instanceof Error ? err.message : String(err), 300)}`);
       try {
         if (!res.headersSent) sendJson(res, 500, 'api_error', GENERIC_ERROR(500));
         else res.destroy();

@@ -3633,14 +3633,14 @@ export class AccountManager {
     // Observers (the guest cap's per-account day totals). One that throws must
     // never cost the response its accounting.
     for (const fn of this._tokenUsageListeners || []) {
-      try { fn(accountIndex, usage); } catch { /* observer bug, not ours */ }
+      try { fn(accountIndex, usage, model); } catch { /* observer bug, not ours */ }
     }
   }
 
   /**
    * Be told about every message's final usage on every account (the same
    * figures recordTokenUsage books). Returns an unsubscribe function.
-   * @param {(accountIndex: number, usage: any) => void} fn
+   * @param {(accountIndex: number, usage: any, model?: any) => void} fn
    */
   onTokenUsage(fn) {
     (this._tokenUsageListeners ??= new Set()).add(fn);
