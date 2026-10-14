@@ -479,8 +479,8 @@ export class GuestUsageTracker {
       row = { day: today, rise: 0, weightedToday: 0, lastUtil: null, lastResetAt: null, seenAt: null };
       this.accounts.set(account, row);
     }
-    // A new day starts from the last reading of the previous one: what the
-    // account spends from here on is today's.
+    // A new day starts with no rise. Its baseline is the next reading unless
+    // the last one is recent and from today (see observeWeekly).
     if (row.day !== today) { row.day = today; row.rise = 0; row.weightedToday = 0; }
     return row;
   }
@@ -518,9 +518,14 @@ export class GuestUsageTracker {
 
   /**
    * A weekly utilization reading (0-1) for `account`. The rise since the last
-   * reading is today's; a weekly reset inside the day (the reset time moves
-   * on, or the figure drops) keeps what was risen before it and counts the new
-   * window from 0.
+   * reading is today's; a weekly reset inside the day keeps what was risen
+   * before it and counts the new window from 0.
+   *
+   * The rise is only booked between two readings close in time: when the
+   * previous one is missing, older than staleMs, or from before today's 00:00
+   * UTC, this reading is a fresh baseline and adds nothing. Otherwise a gap
+   * (days of the guest switched off, a weekly reset in between) would land as
+   * today's rise and lock the guest at once.
    * @param {string} account @param {number|null|undefined} util @param {number|null|undefined} resetAt @param {number|null|undefined} seenAt
    */
   observeWeekly(account, util, resetAt, seenAt) {
@@ -530,13 +535,21 @@ export class GuestUsageTracker {
     const row = this._account(account);
     if (seen != null && row.seenAt != null && seen < row.seenAt) return;
     const reset = Number(resetAt) || null;
-    if (row.lastUtil == null) {
+    const at = seen ?? this.now();
+    const dayStart = Date.parse(`${utcDay(this.now())}T00:00:00Z`);
+    const gap = row.lastUtil == null || row.seenAt == null || at - row.seenAt > this.staleMs || row.seenAt < dayStart;
+    if (gap) {
       row.lastUtil = u;
     } else {
-      const rolled = (reset != null && row.lastResetAt != null && reset > row.lastResetAt + 3_600_000)
-        || u < row.lastUtil - 0.02;
+      const last = /** @type {number} */ (row.lastUtil);
+      // A reset is the reset time moving on, or a drop once the old reset
+      // time has passed. A drop with the old window still running is a
+      // lagging reading (probe vs headers): ignored.
+      const moved = reset != null && row.lastResetAt != null && reset > row.lastResetAt + 3_600_000;
+      const due = row.lastResetAt != null && at >= row.lastResetAt;
+      const rolled = moved || (u < last - 0.02 && due);
       if (rolled) { row.rise += u; row.lastUtil = u; }
-      else if (u > row.lastUtil) { row.rise += u - row.lastUtil; row.lastUtil = u; }
+      else if (u > last) { row.rise += u - last; row.lastUtil = u; }
     }
     if (reset != null) row.lastResetAt = reset;
     if (seen != null) row.seenAt = seen;
@@ -834,8 +847,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       guestUsage.recordAccountWeighted(a.name, weighTokens(usage));
     })
     : () => {};
-  /** @type {Set<string>} guests whose weekly reading was stale, logged once until fresh again */
-  const staleLogged = new Set();
+  /** @type {Map<string, number>} guests whose weekly reading is stale → when that was last logged (once an hour) */
+  const staleLogged = new Map();
   const listeners = new Map(); // "name\0pin" → forwarding listener
   /** @type {Map<string, {inflight: number, reserved: number, recent: number[]}>} */
   const live = new Map();
@@ -930,8 +943,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       return;
     }
     if (sh.stale) {
-      if (!staleLogged.has(name)) {
-        staleLogged.add(name);
+      if (Date.now() - (staleLogged.get(name) ?? -Infinity) >= 3_600_000) {
+        staleLogged.set(name, Date.now());
         log(`[TeamClaude] guest ${name}: no fresh weekly reading for the pinned account, only the ${Number.isFinite(cap) ? cap.toLocaleString('en-US') + '-token' : 'unlimited'} backstop applies until one arrives`);
       }
     } else staleLogged.delete(name);
@@ -995,11 +1008,15 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         req.destroy?.();
         return;
       }
-      // The full request and, below, the full answer as received (guest-log.js).
-      // Never blocks or fails the request.
-      entry = openGuestLog({ config, guest: name, method: req.method, url: req.url, headers: req.headers, body, presentedKey: presentedGuestKey(req.headers), log });
       const pathname = new URL(req.url, 'http://guest.invalid').pathname;
       const checked = checkGuestBody(pathname, req.headers, body);
+      // The full request and, below, the full answer as received (guest-log.js).
+      // A refused body is kept to its first 64 KB: a refusal costs the guest
+      // nothing, so it must not be a way to fill the disk. Never blocks or
+      // fails the request.
+      entry = openGuestLog({ config, guest: name, method: req.method, url: req.url, headers: req.headers,
+        body: checked.ok ? body : body.subarray(0, REFUSED_LOG_BYTES), truncatedFrom: checked.ok || body.length <= REFUSED_LOG_BYTES ? null : body.length,
+        presentedKey: presentedGuestKey(req.headers), log });
       if (!checked.ok) {
         const bad = /** @type {{status: number, type: string, message: string}} */ (/** @type {unknown} */ (checked));
         refuse(bad.status, bad.type, bad.message);
@@ -1097,6 +1114,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
   return Object.assign(handler, { dispose: unsubscribe });
 }
 
+export const REFUSED_LOG_BYTES = 64 * 1024;
 export const DAILY_LIMIT_MESSAGE = 'Daily limit reached. It resets at 00:00 UTC.';
 
 /** @param {number} [ms] */

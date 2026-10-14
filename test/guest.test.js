@@ -12,7 +12,7 @@ import {
   findRemoteSource, stripLongContextBetas, zeroCacheFigures, guestBetas, mediaMinimum,
   weighTokens, guestPct,
 } from '../src/guest.js';
-import { pruneGuestLogs, renderGuestTranscript } from '../src/guest-log.js';
+import { pruneGuestLogs, renderGuestTranscript, setGuestLogBytes, guestLogBytes } from '../src/guest-log.js';
 
 // Guest stream logs default ON and to ~/.local/share: every test here writes
 // under a temp dir instead (guest-log.js reads XDG_DATA_HOME per request).
@@ -968,26 +968,71 @@ test('share % = weekly rise today × guest weighted / account weighted', () => {
 });
 
 test('share %: a weekly reset inside the day keeps what was used before it', () => {
-  let now = Date.UTC(2026, 9, 15, 1, 0);
+  let now = Date.UTC(2026, 9, 15, 11, 50);
   const t = new GuestUsageTracker({ now: () => now });
   t.recordAccountWeighted('ai', 100);
   t.recordGuestWeighted('n', 100);
   t.observeWeekly('ai', 0.90, Date.UTC(2026, 9, 15, 12), now);
-  now += 3600_000;
+  now += 5 * 60_000;
   t.observeWeekly('ai', 0.95, Date.UTC(2026, 9, 15, 12), now);   // +5
-  now = Date.UTC(2026, 9, 15, 13);
+  now = Date.UTC(2026, 9, 15, 12, 5);
   t.observeWeekly('ai', 0.04, Date.UTC(2026, 9, 22, 12), now);   // reset: new window at 4
   assert.ok(Math.abs(t.share('n', 'ai').pct - 9) < 1e-9, String(t.share('n', 'ai').pct));
   now += 60_000;
   t.observeWeekly('ai', 0.10, Date.UTC(2026, 9, 22, 12), now);   // +6
   assert.ok(Math.abs(t.share('n', 'ai').pct - 15) < 1e-9);
-  // a drop without a moved reset time is a reset too
+  // a drop once the old reset time has passed is a reset, even with no new reset time
   const u = new GuestUsageTracker({ now: () => now });
   u.recordAccountWeighted('ai', 1); u.recordGuestWeighted('n', 1);
-  u.observeWeekly('ai', 0.50, null, now);
+  u.observeWeekly('ai', 0.50, now - 60_000, now);
   u.observeWeekly('ai', 0.55, null, now + 1);
   u.observeWeekly('ai', 0.03, null, now + 2);
   assert.ok(Math.abs(u.share('n', 'ai').pct - 8) < 1e-9);
+});
+
+test('share %: a drop while the old window still runs is a lagging reading, not a reset', () => {
+  const now = Date.UTC(2026, 9, 15, 10, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.recordAccountWeighted('ai', 1); t.recordGuestWeighted('n', 1);
+  const reset = Date.UTC(2026, 9, 18);
+  t.observeWeekly('ai', 0.50, reset, now);
+  t.observeWeekly('ai', 0.55, reset, now + 1000);      // +5
+  t.observeWeekly('ai', 0.30, reset, now + 2000);      // lagging probe: ignored
+  t.observeWeekly('ai', 0.56, reset, now + 3000);      // +1 from 55
+  assert.ok(Math.abs(t.share('n', 'ai').pct - 6) < 1e-9, String(t.share('n', 'ai').pct));
+});
+
+test('share %: after a reading gap (days off, a weekly reset between) the next reading is a baseline, no false lock', () => {
+  let now = Date.UTC(2026, 9, 10, 20, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.observeWeekly('ai', 0.10, Date.UTC(2026, 9, 12), now);       // last reading before `nephew off`
+  // three days later, same weekly window gone and a new one at 70%
+  now = Date.UTC(2026, 9, 13, 9, 0);
+  t.recordAccountWeighted('ai', 10); t.recordGuestWeighted('n', 10);
+  t.observeWeekly('ai', 0.70, Date.UTC(2026, 9, 19), now);
+  assert.equal(t.share('n', 'ai').pct, 0);
+  now += 60_000;
+  t.observeWeekly('ai', 0.72, Date.UTC(2026, 9, 19), now);      // +2 from the new baseline
+  assert.ok(Math.abs(t.share('n', 'ai').pct - 2) < 1e-9);
+  // multi-day gap inside one window: same
+  const u = new GuestUsageTracker({ now: () => now });
+  u.observeWeekly('ai', 0.20, Date.UTC(2026, 9, 19), Date.UTC(2026, 9, 11, 8));
+  u.recordAccountWeighted('ai', 1); u.recordGuestWeighted('n', 1);
+  u.observeWeekly('ai', 0.65, Date.UTC(2026, 9, 19), now);
+  assert.equal(u.share('n', 'ai').pct, 0);
+  // a reading from before today's 00:00 UTC is never a baseline for today, even if recent
+  now = Date.UTC(2026, 9, 14, 0, 5);
+  const v = new GuestUsageTracker({ now: () => now });
+  v.observeWeekly('ai', 0.20, null, Date.UTC(2026, 9, 13, 23, 58));
+  v.recordAccountWeighted('ai', 1); v.recordGuestWeighted('n', 1);
+  v.observeWeekly('ai', 0.25, null, now);
+  assert.equal(v.share('n', 'ai').pct, 0);
+  // and a gap longer than staleMs inside the day too
+  const w = new GuestUsageTracker({ now: () => now + 3600_000 });
+  w.observeWeekly('ai', 0.20, null, now);
+  w.recordAccountWeighted('ai', 1); w.recordGuestWeighted('n', 1);
+  w.observeWeekly('ai', 0.40, null, now + 3600_000);
+  assert.equal(w.share('n', 'ai').pct, 0);
 });
 
 test('share %: a stale or missing weekly reading gives no share (backstop only)', () => {
@@ -1006,7 +1051,7 @@ test('share counters, weekly rise and the lock survive a restart (export → JSO
   const now = Date.UTC(2026, 9, 15, 10, 0);
   const t = new GuestUsageTracker({ now: () => now });
   t.observeWeekly('ai', 0.1, null, now);
-  t.observeWeekly('ai', 0.3, null, now);
+  t.observeWeekly('ai', 0.3, null, now + 1);
   t.recordAccountWeighted('ai', 400); t.recordGuestWeighted('n', 100); t.recordTokens('n', 77); t.lock('n');
   const saved = JSON.parse(JSON.stringify({ guests: t.export(), guestAccounts: t.exportAccounts() }));
   const r = new GuestUsageTracker({ now: () => now });
@@ -1131,20 +1176,20 @@ test('stream logs: full request + response saved 0600 in 0700 dirs, auth and the
       const ddir = join(gdir, days[0]);
       assert.equal(statSync(ddir).mode & 0o777, 0o700);
       const files = readdirSync(ddir).sort();
-      assert.equal(files.length, 4, files.join(','));
+      assert.equal(files.length, 6, files.join(','));
       for (const f of files) {
-        assert.match(f, /^\d{6}-[0-9a-f]{8}\.(req\.json|res\.sse)$/);
+        assert.match(f, /^\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)$/);
         assert.equal(statSync(join(ddir, f)).mode & 0o777, 0o600, f);
         const text = readFileSync(join(ddir, f), 'utf8');
         assert.ok(!text.includes(KEY), `${f} carries the guest key`);
         assert.ok(!/t-ai|t-jan|authorization|cookie/i.test(text), `${f} carries a credential`);
       }
-      const reqs = files.filter(f => f.endsWith('.req.json')).map(f => JSON.parse(readFileSync(join(ddir, f), 'utf8')));
-      const main = reqs.find(q => q.body.stream);
-      assert.equal(main.body.messages[0].content[0].text, 'what is the weather');
-      assert.equal(main.headers['anthropic-beta'], 'web-search-2025-03-05');
-      assert.equal(main.headers['x-extra'], undefined);
-      const sseFile = readFileSync(join(ddir, files.find(f => f.endsWith('.res.sse') && f.startsWith(files.find(x => x.endsWith('.req.json') && JSON.parse(readFileSync(join(ddir, x), 'utf8')).body.stream).slice(0, 15)))), 'utf8');
+      const mainStem = files.find(f => f.endsWith('.req.json') && readFileSync(join(ddir, f), 'utf8') === body).slice(0, 15);
+      const meta = JSON.parse(readFileSync(join(ddir, `${mainStem}.meta.json`), 'utf8'));
+      assert.equal(meta.headers['anthropic-beta'], 'web-search-2025-03-05');
+      assert.equal(meta.headers['x-extra'], undefined);
+      assert.equal(meta.url, '/v1/messages?beta=true');
+      const sseFile = readFileSync(join(ddir, `${mainStem}.res.sse`), 'utf8');
       assert.match(sseFile, /"cache_read_input_tokens":900/);       // as received
       assert.match(sseFile, /message_stop/);
       assert.ok(guestUsage.tokensToday('nephew') > 0);
@@ -1186,7 +1231,7 @@ test('stream logs: off with guests.logBodies false; a write error never fails th
 });
 
 test('stream log prune: retention days, then the size backstop (oldest days first)', async () => {
-  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } = await import('node:fs');
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const dir = mkdtempSync(join(tmpdir(), 'tc-guest-prune-'));
@@ -1198,15 +1243,25 @@ test('stream log prune: retention days, then the size backstop (oldest days firs
     mk('other', '2026-10-12', 600_000);
     mk('nephew', '2026-10-15', 300_000);
     mkdirSync(join(dir, 'nephew', 'not-a-day'));
+    // foreign things that only look like ours are never touched
+    mkdirSync(join(dir, 'other', '2026-01-01'), { recursive: true });
+    writeFileSync(join(dir, 'other', '2026-01-01', 'notes.txt'), 'mine');
+    mkdirSync(join(dir, 'with space', '2026-01-01'), { recursive: true });
     const r = await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now });
+    assert.equal(readFileSync(join(dir, 'other', '2026-01-01', 'notes.txt'), 'utf8'), 'mine');
+    assert.equal(existsSync(join(dir, 'with space', '2026-01-01')), true);
     assert.equal(existsSync(join(dir, 'nephew', '2026-06-01')), false);
     assert.equal(existsSync(join(dir, 'nephew', '2026-10-10')), false); // oldest goes for size
     assert.equal(existsSync(join(dir, 'other', '2026-10-12')), true);
     assert.equal(existsSync(join(dir, 'nephew', '2026-10-15')), true);
     assert.equal(existsSync(join(dir, 'nephew', 'not-a-day')), true);
-    assert.equal(r.removed.length, 2);
+    assert.equal(r.removed.length, 3);
     assert.ok(r.bytes <= 1024 * 1024);
     assert.deepEqual((await pruneGuestLogs({ dir: join(dir, 'missing') })).removed, []);
+    // only the configured guests' folders when names are given (a logDir of ~ loses nothing else)
+    mk('stranger', '2020-01-01', 10);
+    await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now, guests: ['nephew'] });
+    assert.equal(existsSync(join(dir, 'stranger', '2020-01-01')), true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1223,7 +1278,8 @@ test('guest CLI: logs renders a transcript; pct sets the per-key cap', async () 
   writeFileSync(cfgPath, JSON.stringify({ accounts: [], guests: { logDir, keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai' }] } }));
   const day = join(logDir, 'nephew', '2026-10-14');
   mkdirSync(day, { recursive: true });
-  writeFileSync(join(day, '101500-abcdef01.req.json'), JSON.stringify({ at: '2026-10-14T10:15:00.000Z', url: '/v1/messages', body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello?' }] } }));
+  writeFileSync(join(day, '101500-abcdef01.req.json'), JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello?' }] }));
+  writeFileSync(join(day, '101500-abcdef01.meta.json'), JSON.stringify({ at: '2026-10-14T10:15:00.000Z', url: '/v1/messages' }));
   writeFileSync(join(day, '101500-abcdef01.res.sse'), JSON.stringify({ type: 'message', model: 'claude-haiku-4-5', content: [{ type: 'text', text: 'hi!' }], usage: { input_tokens: 3, output_tokens: 2 } }));
   const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: home, TEAMCLAUDE_CONFIG: cfgPath };
   try {
@@ -1237,4 +1293,70 @@ test('guest CLI: logs renders a transcript; pct sets the per-key cap', async () 
     assert.equal(pct.status, 0, pct.stderr);
     assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).guests.keys[0].dailyWeeklyPct, 25);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('stream logs: a refused body is logged to its first 64 KB only, the request body raw', async () => {
+  const { mkdtempSync, readdirSync, readFileSync, statSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-refused-'));
+  try {
+    await withGuest(async ({ port, seen }) => {
+      const big = JSON.stringify({ model: 'm', max_tokens: 5, tools: [{ type: 'code_execution_20250825', name: 'c' }], messages: [{ role: 'user', content: 'x'.repeat(7 * 1024 * 1024) }] });
+      const r = await ask(port, { body: big });
+      assert.equal(r.status, 400);
+      await r.text();
+      assert.equal(seen.length, 0);
+      await new Promise(res => setTimeout(res, 100));
+      const ddir = join(dir, 'nephew', readdirSync(join(dir, 'nephew'))[0]);
+      const reqFile = readdirSync(ddir).find(f => f.endsWith('.req.json'));
+      assert.ok(statSync(join(ddir, reqFile)).size <= 64 * 1024, String(statSync(join(ddir, reqFile)).size));
+      assert.equal(readFileSync(join(ddir, reqFile), 'utf8'), big.slice(0, 64 * 1024));   // raw bytes, not re-serialised
+      const meta = JSON.parse(readFileSync(join(ddir, reqFile.replace('.req.json', '.meta.json')), 'utf8'));
+      assert.equal(meta.bodyTruncatedFrom, Buffer.byteLength(big));
+      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), /refused body, .* first 64 KB kept/);
+    }, { guests: { ...guestsConfig(), logDir: dir }, configExtra: {} });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: past logMaxMB the running count stops all writing (one line) until a prune makes room', async () => {
+  const { mkdtempSync, readdirSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { openGuestLog } = await import('../src/guest-log.js');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-budget-'));
+  const config = { guests: { logDir: dir, logMaxMB: 1, keys: [{ name: 'nephew' }] } };
+  try {
+    const logs = [];
+    setGuestLogBytes(dir, 1024 * 1024 - 10);              // 10 bytes left of 1 MB
+    for (let i = 0; i < 3; i++) {
+      assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"a":1}'), log: m => logs.push(m) }), null);
+    }
+    assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1, logs.join('\n'));
+    await new Promise(res => setTimeout(res, 100));        // the kicked prune measured the (empty) log
+    assert.equal(existsSync(join(dir, 'nephew')), false);
+    assert.equal(guestLogBytes(dir), 0);
+    // an answer that crosses the budget mid-stream stops there
+    setGuestLogBytes(dir, 1024 * 1024 - 400);
+    const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"a":1}'), log: m => logs.push(m) });
+    assert.ok(e);
+    e.chunk(Buffer.alloc(100, 97));
+    e.chunk(Buffer.alloc(1000, 98));                       // over: dropped, and nothing after it
+    e.chunk(Buffer.alloc(10, 99));
+    e.end();
+    await new Promise(res => setTimeout(res, 100));
+    const { readFileSync } = await import('node:fs');
+    const ddir = join(dir, 'nephew', readdirSync(join(dir, 'nephew'))[0]);
+    const res = readdirSync(ddir).find(f => f.endsWith('.res.sse'));
+    assert.equal(readFileSync(join(ddir, res), 'utf8'), 'a'.repeat(100));
+    // and through the server: a full budget means the request is served, nothing written
+    const dir2 = mkdtempSync(join(tmpdir(), 'tc-guest-budget2-'));
+    setGuestLogBytes(dir2, 1024 * 1024);
+    await withGuest(async ({ port }) => {
+      const r = await ask(port); await r.text();
+      assert.equal(r.status, 200);
+      assert.equal(existsSync(join(dir2, 'nephew')), false);
+    }, { guests: { ...guestsConfig(), logDir: dir2, logMaxMB: 1 } });
+    rmSync(dir2, { recursive: true, force: true });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

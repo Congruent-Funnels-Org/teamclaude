@@ -2,7 +2,8 @@
 // and the FULL answer, as received from upstream, of every guest request that
 // got as far as a body, so the operator can see what a guest does.
 //
-//   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.req.json   method, url, headers (auth stripped), body
+//   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.req.json   the request body, raw bytes as received
+//   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.meta.json  time, method, url, headers (auth stripped)
 //   <logDir>/<guest>/<YYYY-MM-DD>/<HHMMSS>-<reqid>.res.sse    the response body bytes, SSE or JSON
 //
 // logDir defaults to ~/.local/share/teamclaude/guest-logs (guests.logDir).
@@ -13,10 +14,12 @@
 // Logging never blocks or fails a request: every write is async, and a write
 // error is one log line, the request goes on. Retention: guests.logRetentionDays
 // (default 90) and a size backstop guests.logMaxMB (default 5000, oldest days
-// first), pruned at start and once a day.
+// first), pruned at start and once a day. Between prunes a running byte count
+// (seeded by each prune) stops all writing once logMaxMB is reached, with one
+// log line, and asks for a prune.
 
 import { createWriteStream } from 'node:fs';
-import { mkdir, writeFile, readdir, readFile, stat, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readdir, readFile, stat, rm, rmdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -28,6 +31,8 @@ export const GUEST_LOG_DEFAULTS = {
   maxQueuedBytes: 64 * 1024 * 1024, // held while the file opens; more is dropped
 };
 
+// Only files this module writes are ever deleted.
+const LOG_FILE_RE = /^\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)$/;
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'proxy-authorization', 'cookie', 'set-cookie']);
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -68,23 +73,78 @@ export function sanitizeHeaders(headers, presentedKey = null) {
 
 let lastFailLog = 0;
 
+/** @param {any} config */
+function maxBytesOf(config) {
+  const mb = Number(config?.guests?.logMaxMB);
+  return (mb > 0 ? mb : GUEST_LOG_DEFAULTS.maxMB) * 1024 * 1024;
+}
+
 /**
- * Start the log of one guest request. Returns null when logging is off.
- * `chunk` takes response bytes as they arrive, `end` closes the file.
- * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
- *   presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
- * @returns {{chunk: (b: Buffer) => void, end: () => void, reqPath: string, resPath: string}|null}
+ * The running byte count per log dir: set from disk by each prune, raised by
+ * every write. Past logMaxMB nothing more is written until a prune makes room.
+ * @type {Map<string, {bytes: number, full: boolean, lastKick: number}>}
  */
-export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
+const budgets = new Map();
+/** @param {string} dir */
+function budgetOf(dir) {
+  let b = budgets.get(dir);
+  if (!b) { b = { bytes: 0, full: false, lastKick: 0 }; budgets.set(dir, b); }
+  return b;
+}
+/** For tests and the pruner: what the log under `dir` holds now. @param {string} dir @param {number} bytes */
+export function setGuestLogBytes(dir, bytes) {
+  const b = budgetOf(dir);
+  b.bytes = Math.max(0, Number(bytes) || 0);
+  b.full = false;
+}
+/** @param {string} dir */
+export function guestLogBytes(dir) {
+  return budgetOf(dir).bytes;
+}
+
+/**
+ * Count `n` bytes against the dir's budget. False (and, once, a log line and a
+ * prune request) when the budget is spent.
+ * @param {any} config @param {string} dir @param {number} n @param {(m: string) => void} log
+ */
+function spend(config, dir, n, log) {
+  const b = budgetOf(dir);
+  if (b.bytes + n > maxBytesOf(config)) {
+    if (!b.full) {
+      b.full = true;
+      try { log(`[TeamClaude] guest logs: ${dir} reached guests.logMaxMB (${Math.round(maxBytesOf(config) / 1048576)} MB); not logging until a prune makes room`); } catch { /* nothing */ }
+    }
+    const t = Date.now();
+    if (t - b.lastKick >= 60_000) { b.lastKick = t; runGuestLogPrune(config, log); }
+    return false;
+  }
+  b.bytes += n;
+  return true;
+}
+
+/**
+ * Start the log of one guest request. Returns null when logging is off or the
+ * size budget is spent. `chunk` takes response bytes as they arrive, `end`
+ * closes the file. The body is written as the raw bytes received.
+ * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
+ *   truncatedFrom?: number|null, presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
+ * @returns {{chunk: (b: Buffer) => void, end: () => void, reqPath: string, resPath: string, metaPath: string}|null}
+ */
+export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, truncatedFrom = null, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
   if (!guestLogsEnabled(config)) return null;
+  const base = guestLogDir(config);
   const at = new Date(now);
   const iso = at.toISOString();
   const day = iso.slice(0, 10);
   const id = reqId || randomBytes(4).toString('hex');
   const stem = `${iso.slice(11, 19).replace(/:/g, '')}-${id}`;
-  const dir = join(guestLogDir(config), guestDirName(guest), day);
+  const dir = join(base, guestDirName(guest), day);
   const reqPath = join(dir, `${stem}.req.json`);
+  const metaPath = join(dir, `${stem}.meta.json`);
   const resPath = join(dir, `${stem}.res.sse`);
+  const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url,
+    ...(truncatedFrom ? { bodyTruncatedFrom: truncatedFrom } : {}), headers: sanitizeHeaders(headers, presentedKey) });
+  if (!spend(config, base, body.length + meta.length, log)) return null;
 
   let failed = false;
   const fail = (/** @type {any} */ err) => {
@@ -101,15 +161,13 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   let queue = [];
   let queued = 0;
   let ended = false;
+  let full = false;
   /** @type {import('node:fs').WriteStream|null} */
   let stream = null;
 
-  let parsed;
-  try { parsed = JSON.parse(body.toString('utf8')); } catch { parsed = body.toString('utf8'); }
-  const reqDoc = JSON.stringify({ at: iso, reqId: id, guest, method, url, headers: sanitizeHeaders(headers, presentedKey), body: parsed }, null, 1);
-
   mkdir(dir, { recursive: true, mode: 0o700 })
-    .then(() => writeFile(reqPath, reqDoc, { mode: 0o600, flag: 'wx' }))
+    .then(() => writeFile(metaPath, meta, { mode: 0o600, flag: 'wx' }))
+    .then(() => writeFile(reqPath, body, { mode: 0o600, flag: 'wx' }))
     .then(() => {
       if (failed) return;
       stream = createWriteStream(resPath, { mode: 0o600, flags: 'wx' });
@@ -123,8 +181,11 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   return {
     reqPath,
     resPath,
+    metaPath,
     chunk(b) {
-      if (failed || ended || !b?.length) return;
+      if (failed || ended || full || !b?.length) return;
+      // The answer counts against the budget too; past it the file stops here.
+      if (!spend(config, base, b.length, log)) { full = true; return; }
       if (stream) { stream.write(b); return; }
       if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
       queue.push(Buffer.from(b));
@@ -145,34 +206,49 @@ async function dirBytes(p) {
   try { entries = await readdir(p, { withFileTypes: true }); } catch { return 0; }
   for (const e of entries) {
     const f = join(p, e.name);
-    if (e.isDirectory()) n += await dirBytes(f);
-    else { try { n += (await stat(f)).size; } catch { /* gone */ } }
+    if (e.isFile() && LOG_FILE_RE.test(e.name)) { try { n += (await stat(f)).size; } catch { /* gone */ } }
   }
   return n;
 }
 
 /**
+ * Delete this module's files in one day folder, then the folder if empty.
+ * Nothing else in it (or anywhere) is touched.
+ * @param {string} path
+ */
+async function removeDay(path) {
+  let entries;
+  try { entries = await readdir(path, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) if (e.isFile() && LOG_FILE_RE.test(e.name)) await rm(join(path, e.name), { force: true });
+  try { await rmdir(path); } catch { /* not empty: foreign files stay */ }
+}
+
+/**
  * Remove day folders older than retentionDays, then, while the whole log is
- * over maxMB, the oldest remaining days (today last).
- * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number}} o
+ * over maxMB, the oldest remaining days (today last). Only guest folders
+ * (named as guestDirName names them; `guests` = configured names when given),
+ * only YYYY-MM-DD folders in them, and only this module's own files, so a
+ * mistaken logDir (~, /) can never lose anything else.
+ * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number, guests?: string[]|null}} o
  * @returns {Promise<{removed: string[], bytes: number}>}
  */
-export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now() }) {
+export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now(), guests = null }) {
   /** @type {string[]} */
   const removed = [];
   /** @type {{path: string, day: string, bytes: number}[]} */
   const days = [];
-  let guests;
-  try { guests = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0 }; }
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0 }; }
+  const allowed = guests ? new Set(guests.map(guestDirName)) : null;
   const cutoff = new Date(now - retentionDays * 86_400_000).toISOString().slice(0, 10);
-  for (const g of guests) {
-    if (!g.isDirectory()) continue;
+  for (const g of entries) {
+    if (!g.isDirectory() || guestDirName(g.name) !== g.name || (allowed && !allowed.has(g.name))) continue;
     let ds;
     try { ds = await readdir(join(dir, g.name), { withFileTypes: true }); } catch { continue; }
     for (const d of ds) {
       if (!d.isDirectory() || !DAY_RE.test(d.name)) continue;
       const path = join(dir, g.name, d.name);
-      if (d.name < cutoff) { await rm(path, { recursive: true, force: true }); removed.push(path); continue; }
+      if (d.name < cutoff) { await removeDay(path); removed.push(path); continue; }
       days.push({ path, day: d.name, bytes: await dirBytes(path) });
     }
   }
@@ -181,11 +257,37 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
   days.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
   for (const d of days) {
     if (bytes <= limit) break;
-    await rm(d.path, { recursive: true, force: true });
+    await removeDay(d.path);
     removed.push(d.path);
     bytes -= d.bytes;
   }
   return { removed, bytes };
+}
+
+/** @type {Set<string>} dirs with a prune running */
+const pruning = new Set();
+
+/**
+ * One prune with the live settings; afterwards the running byte count is what
+ * is left on disk. Never throws.
+ * @param {any} config @param {(m: string) => void} [log]
+ * @returns {Promise<void>}
+ */
+export function runGuestLogPrune(config, log = console.log) {
+  if (!guestLogsEnabled(config)) return Promise.resolve();
+  const dir = guestLogDir(config);
+  if (pruning.has(dir)) return Promise.resolve();
+  pruning.add(dir);
+  const g = config?.guests || {};
+  const days = Number(g.logRetentionDays) > 0 ? Number(g.logRetentionDays) : GUEST_LOG_DEFAULTS.retentionDays;
+  const names = Array.isArray(g.keys) ? g.keys.map((/** @type {any} */ k) => k?.name).filter((/** @type {any} */ n) => typeof n === 'string' && n.trim()).map((/** @type {string} */ n) => n.trim()) : [];
+  return pruneGuestLogs({ dir, retentionDays: days, maxMB: maxBytesOf(config) / 1048576, guests: names })
+    .then(r => {
+      setGuestLogBytes(dir, r.bytes);
+      if (r.removed.length) log(`[TeamClaude] guest logs: pruned ${r.removed.length} day folder(s)`);
+    })
+    .catch(err => { try { log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`); } catch { /* nothing */ } })
+    .finally(() => pruning.delete(dir));
 }
 
 /**
@@ -194,15 +296,7 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
  * @returns {() => void} stop
  */
 export function startGuestLogPruner({ config, log = console.log, everyMs = GUEST_LOG_DEFAULTS.pruneEveryMs }) {
-  const run = () => {
-    if (!guestLogsEnabled(config)) return;
-    const g = config?.guests || {};
-    const days = Number(g.logRetentionDays) > 0 ? Number(g.logRetentionDays) : GUEST_LOG_DEFAULTS.retentionDays;
-    const mb = Number(g.logMaxMB) > 0 ? Number(g.logMaxMB) : GUEST_LOG_DEFAULTS.maxMB;
-    pruneGuestLogs({ dir: guestLogDir(config), retentionDays: days, maxMB: mb })
-      .then(r => { if (r.removed.length) log(`[TeamClaude] guest logs: pruned ${r.removed.length} day folder(s)`); })
-      .catch(err => log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`));
-  };
+  const run = () => { runGuestLogPrune(config, log); };
   run();
   const t = setInterval(run, everyMs);
   t.unref?.();
@@ -285,11 +379,15 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
   const out = [`Guest "${guest}", ${day} (UTC): ${files.length} request(s)`];
   for (const f of files) {
     const stem = f.slice(0, -'.req.json'.length);
+    /** @type {any} */
     let req = null;
-    try { req = JSON.parse(await readFile(join(gdir, day, f), 'utf8')); } catch { /* unreadable */ }
+    try { req = JSON.parse(await readFile(join(gdir, day, `${stem}.meta.json`), 'utf8')); } catch { /* none */ }
+    /** @type {any} */
+    let body = {};
+    try { body = JSON.parse(await readFile(join(gdir, day, f), 'utf8')); } catch { body = {}; }
+    if (!body || typeof body !== 'object') body = {};
     let raw = '';
     try { raw = await readFile(join(gdir, day, `${stem}.res.sse`), 'utf8'); } catch { /* none */ }
-    const body = req?.body && typeof req.body === 'object' ? req.body : {};
     const a = parseGuestAnswer(raw);
     const time = (req?.at || '').slice(11, 19) || stem.slice(0, 6);
     const route = String(req?.url || '').split('?')[0];
@@ -297,6 +395,7 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
     const msgs = Array.isArray(body.messages) ? body.messages : [];
     const lastUser = [...msgs].reverse().find((/** @type {any} */ m) => m?.role === 'user');
     if (lastUser) out.push(`USER: ${clip(textOf(lastUser.content), 2000) || '(no text)'}`);
+    if (req?.bodyTruncatedFrom) out.push(`(refused body, ${n(req.bodyTruncatedFrom)} bytes, first 64 KB kept)`);
     if (a.error) out.push(`ERROR: ${clip(a.error, 500)}`);
     if (a.text) out.push(`ASSISTANT: ${clip(a.text, 4000)}`);
     if (a.tools.length) out.push(`TOOLS: ${a.tools.join(', ')}`);
