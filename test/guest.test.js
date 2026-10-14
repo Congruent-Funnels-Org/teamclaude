@@ -1230,8 +1230,8 @@ test('stream logs: off with guests.logBodies false; a write error never fails th
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('stream log prune: retention days, then the size backstop (oldest days first)', async () => {
-  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } = await import('node:fs');
+test('stream log prune: retention days, then past 90% of logMaxMB down to 80% (oldest days first, today last)', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, symlinkSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const dir = mkdtempSync(join(tmpdir(), 'tc-guest-prune-'));
@@ -1252,16 +1252,28 @@ test('stream log prune: retention days, then the size backstop (oldest days firs
     assert.equal(existsSync(join(dir, 'with space', '2026-01-01')), true);
     assert.equal(existsSync(join(dir, 'nephew', '2026-06-01')), false);
     assert.equal(existsSync(join(dir, 'nephew', '2026-10-10')), false); // oldest goes for size
-    assert.equal(existsSync(join(dir, 'other', '2026-10-12')), true);
-    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15')), true);
+    assert.equal(existsSync(join(dir, 'other', '2026-10-12')), false);  // and the next, down to 80%
+    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15')), true);  // today's last
     assert.equal(existsSync(join(dir, 'nephew', 'not-a-day')), true);
-    assert.equal(r.removed.length, 3);
-    assert.ok(r.bytes <= 1024 * 1024);
+    assert.equal(r.removed.length, 4);
+    assert.ok(r.bytes <= 0.8 * 1024 * 1024);
     assert.deepEqual((await pruneGuestLogs({ dir: join(dir, 'missing') })).removed, []);
-    // only the configured guests' folders when names are given (a logDir of ~ loses nothing else)
+    // a removed guest's folder is still pruned; a symlinked folder is never followed
     mk('stranger', '2020-01-01', 10);
-    await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now, guests: ['nephew'] });
-    assert.equal(existsSync(join(dir, 'stranger', '2020-01-01')), true);
+    const outside = mkdtempSync(join(tmpdir(), 'tc-guest-outside-'));
+    mkdirSync(join(outside, '2020-01-01'));
+    writeFileSync(join(outside, '2020-01-01', '000000-aaaaaaaa.res.sse'), 'keep');
+    symlinkSync(outside, join(dir, 'linked'));
+    await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now });
+    assert.equal(existsSync(join(dir, 'stranger', '2020-01-01')), false);
+    assert.equal(readFileSync(join(outside, '2020-01-01', '000000-aaaaaaaa.res.sse'), 'utf8'), 'keep');
+    rmSync(outside, { recursive: true, force: true });
+    // over 90% with only today's folder: it goes too, so logging can resume
+    const solo = mkdtempSync(join(tmpdir(), 'tc-guest-solo-'));
+    mkdirSync(join(solo, 'nephew', '2026-10-15'), { recursive: true });
+    writeFileSync(join(solo, 'nephew', '2026-10-15', '000000-aaaaaaaa.res.sse'), Buffer.alloc(1_000_000));
+    assert.equal((await pruneGuestLogs({ dir: solo, maxMB: 1, now })).bytes, 0);
+    rmSync(solo, { recursive: true, force: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1359,4 +1371,53 @@ test('stream logs: past logMaxMB the running count stops all writing (one line) 
     }, { guests: { ...guestsConfig(), logDir: dir2, logMaxMB: 1 } });
     rmSync(dir2, { recursive: true, force: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: a full budget with older days is pruned to the low-water mark and logging resumes', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-lowwater-'));
+  try {
+    // 1 MB cap, a recent older day holding 1 MB minus a little: the budget is spent
+    const recent = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+    mkdirSync(join(dir, 'nephew', recent), { recursive: true });
+    writeFileSync(join(dir, 'nephew', recent, '000000-aaaaaaaa.res.sse'), Buffer.alloc(1024 * 1024 - 50));
+    setGuestLogBytes(dir, 1024 * 1024 - 50);
+    await withGuest(async ({ port, logs }) => {
+      const r1 = await ask(port); await r1.text();
+      assert.equal(r1.status, 200);
+      await new Promise(res => setTimeout(res, 150));      // the kicked prune
+      assert.equal(existsSync(join(dir, 'nephew', recent)), false, 'the oldest day goes');
+      assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1);
+      const r2 = await ask(port); await r2.text();
+      await new Promise(res => setTimeout(res, 100));
+      const today = new Date().toISOString().slice(0, 10);
+      assert.ok(readdirSync(join(dir, 'nephew', today)).some(f => f.endsWith('.req.json')), 'a new request IS logged');
+    }, { guests: { ...guestsConfig(), logDir: dir, logMaxMB: 1 } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: a prune that frees nothing keeps the budget full and quiet', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { openGuestLog, runGuestLogPrune } = await import('../src/guest-log.js');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-quiet-'));
+  const day = join(dir, 'nephew', '2026-10-14');
+  const config = { guests: { logDir: dir, logMaxMB: 1 } };
+  try {
+    // a full log the prune cannot delete (read-only day folder)
+    mkdirSync(day, { recursive: true });
+    writeFileSync(join(day, '000000-aaaaaaaa.res.sse'), Buffer.alloc(1024 * 1024));
+    chmodSync(day, 0o500);
+    const logs = [];
+    setGuestLogBytes(dir, 1024 * 1024);
+    assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }), null);
+    await new Promise(res => setTimeout(res, 50));
+    await runGuestLogPrune(config, m => logs.push(m));
+    await runGuestLogPrune(config, m => logs.push(m));
+    assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }), null);
+    assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1, logs.join('\n'));
+  } finally { try { chmodSync(day, 0o700); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
 });

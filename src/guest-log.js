@@ -14,9 +14,10 @@
 // Logging never blocks or fails a request: every write is async, and a write
 // error is one log line, the request goes on. Retention: guests.logRetentionDays
 // (default 90) and a size backstop guests.logMaxMB (default 5000, oldest days
-// first), pruned at start and once a day. Between prunes a running byte count
-// (seeded by each prune) stops all writing once logMaxMB is reached, with one
-// log line, and asks for a prune.
+// first, freeing down to 80% once past 90%), pruned at start and once a day.
+// Between prunes a running byte count (seeded by each prune) stops all writing
+// once logMaxMB is reached, with one log line, and asks for a prune, which
+// frees room so logging resumes.
 
 import { createWriteStream } from 'node:fs';
 import { mkdir, writeFile, readdir, readFile, stat, rm, rmdir } from 'node:fs/promises';
@@ -91,11 +92,16 @@ function budgetOf(dir) {
   if (!b) { b = { bytes: 0, full: false, lastKick: 0 }; budgets.set(dir, b); }
   return b;
 }
-/** For tests and the pruner: what the log under `dir` holds now. @param {string} dir @param {number} bytes */
-export function setGuestLogBytes(dir, bytes) {
+/**
+ * For tests and the pruner: what the log under `dir` holds now. `keepFull`
+ * leaves a "full" state (and so its one log line) alone: a prune that freed
+ * nothing must not re-announce it.
+ * @param {string} dir @param {number} bytes @param {{keepFull?: boolean}} [o]
+ */
+export function setGuestLogBytes(dir, bytes, { keepFull = false } = {}) {
   const b = budgetOf(dir);
   b.bytes = Math.max(0, Number(bytes) || 0);
-  b.full = false;
+  if (!keepFull) b.full = false;
 }
 /** @param {string} dir */
 export function guestLogBytes(dir) {
@@ -223,26 +229,32 @@ async function removeDay(path) {
   try { await rmdir(path); } catch { /* not empty: foreign files stay */ }
 }
 
+// Size backstop with a gap: past HIGH of logMaxMB a prune frees down to LOW,
+// so the running count has room again and logging resumes (the budget never
+// lets the total pass logMaxMB, so pruning only "while over" would free nothing).
+export const PRUNE_HIGH = 0.9;
+export const PRUNE_LOW = 0.8;
+
 /**
- * Remove day folders older than retentionDays, then, while the whole log is
- * over maxMB, the oldest remaining days (today last). Only guest folders
- * (named as guestDirName names them; `guests` = configured names when given),
- * only YYYY-MM-DD folders in them, and only this module's own files, so a
- * mistaken logDir (~, /) can never lose anything else.
- * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number, guests?: string[]|null}} o
+ * Remove day folders older than retentionDays; then, when the whole log is
+ * over 90% of maxMB, the oldest days until it is at most 80% (other days
+ * first, today's last). Only folders named as guestDirName names them (a
+ * removed guest's too), only YYYY-MM-DD folders in them, only this module's
+ * own files, never through a symlink, so a mistaken logDir (~, /) can never
+ * lose anything else.
+ * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number}} o
  * @returns {Promise<{removed: string[], bytes: number}>}
  */
-export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now(), guests = null }) {
+export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now() }) {
   /** @type {string[]} */
   const removed = [];
   /** @type {{path: string, day: string, bytes: number}[]} */
   const days = [];
   let entries;
   try { entries = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0 }; }
-  const allowed = guests ? new Set(guests.map(guestDirName)) : null;
   const cutoff = new Date(now - retentionDays * 86_400_000).toISOString().slice(0, 10);
   for (const g of entries) {
-    if (!g.isDirectory() || guestDirName(g.name) !== g.name || (allowed && !allowed.has(g.name))) continue;
+    if (!g.isDirectory() || guestDirName(g.name) !== g.name) continue;
     let ds;
     try { ds = await readdir(join(dir, g.name), { withFileTypes: true }); } catch { continue; }
     for (const d of ds) {
@@ -254,12 +266,16 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
   }
   let bytes = days.reduce((s, d) => s + d.bytes, 0);
   const limit = maxMB * 1024 * 1024;
-  days.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
-  for (const d of days) {
-    if (bytes <= limit) break;
-    await removeDay(d.path);
-    removed.push(d.path);
-    bytes -= d.bytes;
+  if (bytes > limit * PRUNE_HIGH) {
+    const today = new Date(now).toISOString().slice(0, 10);
+    // Oldest first, today's folders after every older one.
+    days.sort((a, b) => ((a.day === today) - (b.day === today)) || (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    for (const d of days) {
+      if (bytes <= limit * PRUNE_LOW) break;
+      await removeDay(d.path);
+      removed.push(d.path);
+      bytes -= d.bytes;
+    }
   }
   return { removed, bytes };
 }
@@ -280,10 +296,10 @@ export function runGuestLogPrune(config, log = console.log) {
   pruning.add(dir);
   const g = config?.guests || {};
   const days = Number(g.logRetentionDays) > 0 ? Number(g.logRetentionDays) : GUEST_LOG_DEFAULTS.retentionDays;
-  const names = Array.isArray(g.keys) ? g.keys.map((/** @type {any} */ k) => k?.name).filter((/** @type {any} */ n) => typeof n === 'string' && n.trim()).map((/** @type {string} */ n) => n.trim()) : [];
-  return pruneGuestLogs({ dir, retentionDays: days, maxMB: maxBytesOf(config) / 1048576, guests: names })
+  return pruneGuestLogs({ dir, retentionDays: days, maxMB: maxBytesOf(config) / 1048576 })
     .then(r => {
-      setGuestLogBytes(dir, r.bytes);
+      // Still full after a prune that freed nothing: stay quiet about it.
+      setGuestLogBytes(dir, r.bytes, { keepFull: r.removed.length === 0 && r.bytes >= maxBytesOf(config) * PRUNE_HIGH });
       if (r.removed.length) log(`[TeamClaude] guest logs: pruned ${r.removed.length} day folder(s)`);
     })
     .catch(err => { try { log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`); } catch { /* nothing */ } })
