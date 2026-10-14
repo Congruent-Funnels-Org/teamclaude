@@ -717,7 +717,7 @@ test('findRemoteSource / stripLongContextBetas units', () => {
   assert.equal(findRemoteSource([{ type: 'text', text: 'x' }]), null);
   assert.match(findRemoteSource([{ content: [{ content: [{ source: { type: 'url' } }] }] }]), /url/);
   assert.equal(stripLongContextBetas('context-1m-2025-08-07'), undefined);
-  assert.equal(stripLongContextBetas('oauth-2025-04-20, context-1m-2025-08-07,fine-grained-tool-streaming-2025-05-14'), 'oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14');
+  assert.equal(stripLongContextBetas('oauth-2025-04-20, context-1m-2025-08-07,interleaved-thinking-2025-05-14'), 'oauth-2025-04-20,interleaved-thinking-2025-05-14');
   assert.equal(stripLongContextBetas(undefined), undefined);
 });
 
@@ -793,16 +793,18 @@ test('betas are allow-listed; the OAuth beta is added for a subscription pin', (
   assert.equal(guestBetas(undefined, { oauth: true }), 'oauth-2025-04-20');
   assert.equal(guestBetas('oauth-2025-04-20', { oauth: true }), 'oauth-2025-04-20');
   assert.equal(guestBetas('effort-2025-11-24', { oauth: false }), 'effort-2025-11-24');
+  // exact names: a future beta sharing an allowed prefix does not slip in
+  assert.equal(guestBetas('thinking-unbounded-2027-01-01,effort-2027-05-05,claude-code-20270101,oauth-2099-01-01'), undefined);
 });
 
 test('a guest request to an OAuth pin carries the OAuth beta upstream, and no disallowed beta', async () => {
   await withGuest(async ({ port, seen }) => {
-    const r = await ask(port, { headers: { 'anthropic-beta': 'claude-code-20250219,files-api-2025-04-14,cache-keepalive-2026-09-03' } });
+    const r = await ask(port, { headers: { 'anthropic-beta': 'claude-code-20250219,files-api-2025-04-14,cache-keepalive-2026-09-03,effort-2099-01-01' } });
     await r.text();
     assert.equal(r.status, 200);
     const b = String(seen[0].beta).split(',');
     assert.ok(b.includes('oauth-2025-04-20') && b.includes('claude-code-20250219'), seen[0].beta);
-    assert.ok(!b.some(x => /files-api|cache-keepalive/.test(x)), seen[0].beta);
+    assert.ok(!b.some(x => /files-api|cache-keepalive|2099/.test(x)), seen[0].beta);
   });
 });
 
@@ -850,6 +852,8 @@ test('images and PDFs reserve a floor beyond their bytes', () => {
   assert.equal(mediaMinimum([{ role: 'user', content: [{ type: 'image', source: { type: 'base64', data: 'x' } }, { type: 'image', source: { type: 'base64', data: 'y' } }] }]), 3200);
   assert.equal(mediaMinimum([{ content: [pdf(2)] }]), 6000);
   assert.equal(mediaMinimum([{ content: [pdf(0)] }]), 100000);
+  const objstm = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: Buffer.from('%PDF /Type /Page /Type /ObjStm').toString('base64') } };
+  assert.equal(mediaMinimum([{ content: [objstm] }]), 100000);   // pages hidden in object streams
   assert.equal(mediaMinimum([{ content: [{ type: 'tool_result', content: [{ type: 'image', source: {} }] }] }]), 1600);
   assert.equal(mediaMinimum([{ content: [{ type: 'tool_use', input: { type: 'image' } }] }]), 0);
   const est = checkGuestBody('/v1/messages', {}, Buffer.from(JSON.stringify({ max_tokens: 10, messages: [{ role: 'user', content: [pdf(0)] }] })));
