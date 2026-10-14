@@ -8,6 +8,7 @@ import {
   createGuestServer, startGuestListener, GuestUsageTracker, guestStatus,
   hashGuestKey, newGuestKey, resolveGuestKey, presentedGuestKey,
   isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight,
+  guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
 } from '../src/guest.js';
 
 function listen(server) {
@@ -21,7 +22,7 @@ function oauth(name) {
 const KEY = 'tcg-test-key-0123456789';
 
 function guestsConfig(extra = {}) {
-  return { keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai', dailyTokenCap: 0, enabled: true, ...extra }] };
+  return { keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai', dailyTokenCap: 'unlimited', enabled: true, ...extra }] };
 }
 
 // ── units ────────────────────────────────────────────────────────────────────
@@ -71,9 +72,41 @@ test('only the inference routes are allowed, matched on the exact pathname', () 
   ]) assert.equal(isAllowedGuestRoute(m, u), false, `${m} ${u}`);
 });
 
-test('wildcard hosts are refused', () => {
-  for (const h of ['0.0.0.0', '::', '', ' ', '*', undefined]) assert.ok(isWildcardHost(h), String(h));
-  assert.ok(!isWildcardHost('100.99.200.17'));
+test('only one literal tailnet/loopback IP may be the listen host', () => {
+  for (const h of ['0.0.0.0', '::', '', ' ', '*', undefined, '0', '::0', '0:0:0:0:0:0:0:0', '[::]', '::ffff:0.0.0.0', '::ffff:0:0',
+    '0.0.0.0.', 'localhost', 'enso', 'enso.tail207e06.ts.net', '192.168.1.5', '10.0.0.1', '100.128.0.1', '100.63.255.255',
+    '8.8.8.8', 'fe80::1', '2001:db8::1', '::ffff:192.168.1.5', '1.2.3']) {
+    assert.ok(isWildcardHost(h), `should refuse ${String(h)}`);
+    assert.ok(guestHostProblem(h));
+  }
+  for (const h of ['100.99.200.17', '100.64.0.1', '100.127.255.254', '127.0.0.1', '::1', '[::1]', 'fd7a:115c:a1e0::1', '::ffff:100.99.200.17']) {
+    assert.equal(guestHostProblem(h), null, h);
+  }
+});
+
+test('a missing or zero cap fails closed; "unlimited" is explicit', () => {
+  assert.equal(guestCap({}), null);
+  assert.equal(guestCap({ dailyTokenCap: 0 }), null);
+  assert.equal(guestCap({ dailyTokenCap: -5 }), null);
+  assert.equal(guestCap({ dailyTokenCap: 'lots' }), null);
+  assert.equal(guestCap({ dailyTokenCap: 3000000 }), 3000000);
+  assert.equal(guestCap({ dailyTokenCap: 'unlimited' }), Infinity);
+});
+
+test('estimateRequestTokens = bytes/3 + max_tokens', () => {
+  const body = Buffer.from(JSON.stringify({ max_tokens: 100, messages: [] }));
+  assert.equal(estimateRequestTokens(body), Math.ceil(body.length / 3) + 100);
+  assert.equal(estimateRequestTokens(Buffer.alloc(0)), 0);
+  assert.equal(estimateRequestTokens(Buffer.from('nope')), 2);
+});
+
+test('scrubErrorBody never names an account', () => {
+  const out = scrubErrorBody(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream refused the credential for account "ai@x.com" (403)' } }), 502, ['ai@x.com']);
+  assert.ok(!out.includes('ai@x.com'));
+  assert.match(JSON.parse(out).error.message, /relay could not serve/);
+  const kept = JSON.parse(scrubErrorBody(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'prompt is too long' } }), 400, ['ai@x.com']));
+  assert.equal(kept.error.message, 'prompt is too long');
+  assert.match(scrubErrorBody('<html>ai@x.com</html>', 502, ['ai@x.com']), /relay could not serve/);
 });
 
 test('GuestUsageTracker resets "today" on a new UTC day and keeps lifetime totals', () => {
@@ -102,7 +135,7 @@ test('guestStatus shows counters and never a key or hash', () => {
 
 // The mock upstream answers per account (by the bearer it receives), so a test
 // can make the PINNED account fail and prove the other one is never asked.
-async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accounts = ['jan', 'ai'] } = {}) {
+async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accounts = ['jan', 'ai'], hooks = {}, guestUsage: usage = null, configExtra = {} } = {}) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     let body = '';
@@ -119,13 +152,13 @@ async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accou
   const upstreamPort = await listen(upstream);
   // No refresh token: a 401 must not send the test to the real OAuth endpoint.
   const am = new AccountManager(accounts.map(n => ({ ...oauth(n), refreshToken: undefined })), 0.98);
-  const config = { proxy: { apiKey: 'main-key' }, upstream: `http://127.0.0.1:${upstreamPort}`, guests };
-  const guestUsage = new GuestUsageTracker();
+  const config = { proxy: { apiKey: 'main-key' }, upstream: `http://127.0.0.1:${upstreamPort}`, guests, ...configExtra };
+  const guestUsage = usage || new GuestUsageTracker();
   const logs = [];
-  const guest = createGuestServer({ accountManager: am, config, guestUsage, log: m => logs.push(m) });
+  const guest = createGuestServer({ accountManager: am, config, guestUsage, hooks, log: m => logs.push(m) });
   const port = await listen(guest);
   try {
-    return await run({ port, seen, am, guestUsage, config, logs });
+    return await run({ port, seen, am, guestUsage, config, logs, guest });
   } finally {
     guest.closeAllConnections?.();
     guest.close();
@@ -152,7 +185,7 @@ test('a guest request is served by its pinned account with the account token, gu
     assert.equal(seen[0].cookie, undefined);
     assert.ok(!seen[0].body.includes(KEY));
     assert.equal(res.headers.get('set-cookie'), null);
-    assert.equal(res.headers.get('x-ok'), '1');
+    assert.equal(res.headers.get('x-ok'), null);   // not on the allow-list
     // input + output + cache read + cache write
     assert.equal(guestUsage.tokensToday('nephew'), 135);
     assert.equal(guestUsage.get('nephew').requestsToday, 1);
@@ -365,7 +398,7 @@ test('startGuestListener refuses a wildcard host and does nothing without config
   const am = new AccountManager([oauth('ai')], 0.98);
   const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '0.0.0.0', port: 3460 }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { log: m => logs.push(m) });
   assert.equal(r.server, null);
-  assert.match(r.state.error, /wildcard/);
+  assert.match(r.state.error, /unspecified address/);
   const off = startGuestListener({ accountManager: am, config: {}, guestUsage: new GuestUsageTracker() }, { log: () => {} });
   assert.equal(off.server, null);
   assert.equal(off.state.listening, false);
@@ -374,8 +407,8 @@ test('startGuestListener refuses a wildcard host and does nothing without config
 test('startGuestListener retries an address that is not on this machine, never another', async () => {
   const logs = [];
   const am = new AccountManager([oauth('ai')], 0.98);
-  // TEST-NET-1: never assigned to a local interface.
-  const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '192.0.2.1', port: 3460 }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { retryMs: 30, log: m => logs.push(m) });
+  // A tailnet-range address this machine does not hold.
+  const r = startGuestListener({ accountManager: am, config: { guests: { listen: { host: '100.64.0.123', port: 3460 }, keys: [] } }, guestUsage: new GuestUsageTracker() }, { retryMs: 30, log: m => logs.push(m) });
   await new Promise(resolve => setTimeout(resolve, 120));
   r.stop();
   assert.equal(r.state.listening, false);
@@ -402,4 +435,149 @@ test('teamclaude status renders a Guests section', async () => {
   const text = Array.isArray(out) ? out.join('\n') : out;
   assert.match(text, /Guests 100\.99\.200\.17:3460, not listening \(EADDRNOTAVAIL\)/);
   assert.match(text, /nephew {2}enabled {2}→ ai@x {2}1,234\/3,000,000 tokens today, 2 req/);
+});
+
+// ── bounce 1: caps, limits, leaks ───────────────────────────────────────────
+
+test('a key with no cap configured is refused (fails closed)', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const res = await ask(port);
+    assert.equal(res.status, 403);
+    await res.text();
+    assert.equal(seen.length, 0);
+  }, { guests: guestsConfig({ dailyTokenCap: undefined }) });
+});
+
+// A slow upstream so requests overlap. Each request's estimate (~51 tokens)
+// fits a 120-token cap once, but not three times: reserve-before-send has to
+// stop the parallel ones even though nothing has been booked yet.
+const slow = (req, res) => setTimeout(() => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ usage: { input_tokens: 40, output_tokens: 10 } }));
+}, 150);
+
+test('parallel requests at the cap edge cannot all slip under it', async () => {
+  await withGuest(async ({ port, seen, guestUsage }) => {
+    const results = await Promise.all([ask(port), ask(port), ask(port)]);
+    const statuses = results.map(r => r.status);
+    await Promise.all(results.map(r => r.text()));
+    // concurrency 2 + reservation: exactly the first 2 can be in flight, and
+    // only as many as the cap's estimate room allows.
+    assert.ok(statuses.filter(s => s === 200).length <= 2, statuses.join(','));
+    assert.ok(statuses.includes(429), statuses.join(','));
+    assert.ok(seen.length <= 2);
+    assert.ok(guestUsage.tokensToday('nephew') <= 120 + 50, String(guestUsage.tokensToday('nephew')));
+  }, { upstreamFor: { ai: slow }, guests: guestsConfig({ dailyTokenCap: 120, maxConcurrent: 5 }) });
+});
+
+test('at most maxConcurrent (default 2) requests per key are in flight', async () => {
+  assert.equal(GUEST_DEFAULTS.maxConcurrent, 2);
+  await withGuest(async ({ port, seen }) => {
+    const results = await Promise.all([ask(port), ask(port), ask(port), ask(port)]);
+    const statuses = results.map(r => r.status);
+    await Promise.all(results.map(r => r.text()));
+    assert.equal(statuses.filter(s => s === 200).length, 2, statuses.join(','));
+    assert.equal(statuses.filter(s => s === 429).length, 2);
+    assert.equal(seen.length, 2);
+    // and the slots come back
+    const after = await ask(port);
+    await after.text();
+    assert.equal(after.status, 200);
+  }, { upstreamFor: { ai: slow } });
+});
+
+test('requests per minute are limited per key, count_tokens included', async () => {
+  await withGuest(async ({ port }) => {
+    const codes = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await ask(port, { path: '/v1/messages/count_tokens' });
+      await r.text();
+      codes.push(r.status);
+    }
+    assert.deepEqual(codes, [200, 200, 200, 429]);
+  }, { guests: guestsConfig({ requestsPerMinute: 3 }) });
+});
+
+test('an oversized body is 413 and never forwarded', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'x-api-key': KEY, 'content-type': 'application/json' }, body: 'x'.repeat(5000) }).catch(e => e);
+    if (res instanceof Error) return; // the socket may be cut mid-upload; either way nothing went upstream
+    assert.equal(res.status, 413);
+    await res.text().catch(() => {});
+    assert.equal(seen.length, 0);
+  }, { guests: { ...guestsConfig(), maxBodyBytes: 1000 } });
+});
+
+test('the listener is bounded: maxConnections and timeouts', async () => {
+  await withGuest(async ({ guest }) => {
+    assert.equal(guest.maxConnections, GUEST_DEFAULTS.maxConnections);
+    assert.equal(guest.headersTimeout, GUEST_DEFAULTS.headersTimeoutMs);
+    assert.equal(guest.requestTimeout, GUEST_DEFAULTS.requestTimeoutMs);
+  });
+});
+
+test('a throw inside the guest handler is a 500, not a crash', async () => {
+  const boom = new GuestUsageTracker();
+  boom.recordRequest = () => { throw new Error('forced'); };
+  await withGuest(async ({ port, logs }) => {
+    const res = await ask(port);
+    await res.text();
+    assert.equal(res.status, 500);
+    assert.ok(logs.some(l => /guest handler error: forced/.test(l)));
+    // still serving
+    const again = await ask(port);
+    await again.text();
+    assert.equal(again.status, 500);
+  }, { guestUsage: boom });
+});
+
+test('only allow-listed response headers reach the guest', async () => {
+  const leaky = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'anthropic-organization-id': 'org-secret', 'request-id': 'req_1',
+      'anthropic-ratelimit-unified-status': 'allowed', 'x-envoy-upstream-service-time': '5', 'set-cookie': 'a=b' });
+    res.end('{"usage":{"input_tokens":1,"output_tokens":1}}');
+  };
+  await withGuest(async ({ port }) => {
+    const res = await ask(port);
+    await res.text();
+    assert.equal(res.headers.get('anthropic-organization-id'), null);
+    assert.equal(res.headers.get('x-envoy-upstream-service-time'), null);
+    assert.equal(res.headers.get('set-cookie'), null);
+    assert.equal(res.headers.get('request-id'), 'req_1');
+    assert.equal(res.headers.get('anthropic-ratelimit-unified-status'), 'allowed');
+  }, { upstreamFor: { ai: leaky } });
+});
+
+test('a refused credential (403) does not name the account to the guest', async () => {
+  const refuse = (req, res) => { res.writeHead(403, { 'content-type': 'application/json' }); res.end('{"type":"error","error":{"type":"permission_error","message":"no"}}'); };
+  await withGuest(async ({ port }) => {
+    const res = await ask(port);
+    const text = await res.text();
+    assert.ok(res.status >= 400);
+    assert.ok(!/\bai\b|"ai"|jan/.test(text), text);
+    assert.doesNotThrow(() => JSON.parse(text));
+  }, { upstreamFor: { ai: refuse } });
+});
+
+test('a guest session id is namespaced before routing', async () => {
+  const sessions = [];
+  await withGuest(async ({ port }) => {
+    const res = await ask(port, { headers: { 'x-claude-code-session-id': 'jans-session-1' } });
+    await res.text();
+    assert.deepEqual(sessions, ['guest:nephew:jans-session-1']);
+  }, { hooks: { onRequestStart: (_id, info) => sessions.push(info.sessionId) } });
+});
+
+test('guest prompts are not written to the request log unless guests.logBodies', async () => {
+  const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-log-'));
+  try {
+    await withGuest(async ({ port }) => {
+      const res = await ask(port);
+      await res.text();
+      assert.deepEqual(readdirSync(dir), []);
+    }, { configExtra: { logDir: dir } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

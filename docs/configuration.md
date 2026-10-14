@@ -97,7 +97,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
   "listen": { "host": "100.99.200.17", "port": 3460 },
   "keys": [
     { "name": "nephew", "keyHash": "<sha256 hex>", "account": "ai@example.com",
-      "dailyTokenCap": 3000000, "enabled": true }
+      "dailyTokenCap": 3000000, "maxConcurrent": 2, "requestsPerMinute": 60, "enabled": true }
   ]
 }
 ```
@@ -107,12 +107,14 @@ While the config is being rewritten — by the server rotating a refresh token, 
 | Routes | `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models` (+ `/v1/models/<id>`), matched on the exact pathname (the query string passes). Anything else is 404; `CONNECT` is 405 and upgrades are refused at the socket. No dashboard, status, reload, OAuth, MCP, event logging or `/tc-acct/` |
 | Auth | `x-api-key` or `Authorization: Bearer`, compared constant-time against `keyHash` (sha256). The plaintext key is never stored. Wrong, missing or disabled key: 401 |
 | Pin | Every request is forced onto `account` (name, email or uuid, as for `TC_ACCT`). It never rotates, never takes the 429/5xx failover hop, never holds: if that account is limited or broken the guest gets the error. An `account` that is not configured is a 503 |
-| Headers | Client `authorization`, `x-api-key`, `proxy-authorization` and `cookie` are dropped before forwarding; `set-cookie`/auth headers are dropped from responses. Usage-dimension headers from a guest are ignored |
-| Daily cap | `dailyTokenCap` tokens per **UTC day** (0 = none), counting input + output + cache-write + cache-read tokens as the responses report them, streaming included. Checked before sending, so the request that crosses the cap completes and the next one is 429 with `retry-after` = seconds to UTC midnight |
-| Listen | Bound at server start. A wildcard host (`0.0.0.0`, `::`) is refused. If the address is not on the machine yet (a tailscale IP before tailscaled is up) the bind is retried every 10 s; it never falls back to another address. A `listen` change needs a restart; `keys` edits apply on reload |
+| Headers | Client `authorization`, `x-api-key`, `proxy-authorization` and `cookie` are dropped before forwarding. Only `content-type`, `content-length`, `content-encoding`, `cache-control`, `date`, `request-id`, `x-request-id`, `retry-after` and `anthropic-ratelimit-*` come back. Error answers (status ≥ 400) are scrubbed: a proxy error, or any message naming an account, becomes a generic one. Usage-dimension headers from a guest are ignored; its `x-claude-code-session-id` is namespaced `guest:<name>:<id>` before routing |
+| Daily cap | `dailyTokenCap` tokens per **UTC day**: a number above 0, or `"unlimited"`. Missing / 0 = the key is refused (403), so a forgotten cap fails closed. Counts input + output + cache-write + cache-read tokens as the responses report them, streaming included. Each request reserves its worst case (prompt bytes/3 + `max_tokens`) before it is sent and settles against real usage when it ends; over the cap → 429 with `retry-after` = seconds to UTC midnight |
+| Limits | Per key: `maxConcurrent` (default 2) in flight, `requestsPerMinute` (default 60, every route incl. count_tokens) → 429. Listener: 16 connections, 15 s for headers, 120 s to receive a request, bodies ≤ `guests.maxBodyBytes` (default 32 MB) → 413. A throw in the guest handler is a 500, never a crash |
+| Logging | A guest's prompts and responses are NOT written to `logDir`; `guests.logBodies: true` opts in |
+| Listen | Bound at server start, to ONE literal IP: tailnet `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, or loopback. Hostnames and every spelling of the unspecified address (`0.0.0.0`, `0`, `::`, `::0`, `::ffff:0.0.0.0`) are refused. If the address is not on the machine yet (a tailscale IP before tailscaled is up) the bind is retried every 10 s; it never falls back to another address. A `listen` change needs a restart; `keys` edits apply on reload |
 | Visibility | `teamclaude status`, `/teamclaude/status` (`guests`) and the dashboard show each key's account, state, tokens/requests today, cap and last seen. Activity-log lines carry `[guest:<name>]`. Counters persist in the state file |
 
-Manage keys with `teamclaude guest`: `add <name> --account <acct> [--cap N] [--key-file F]` prints (or writes, mode 600) the new key once; `rotate`, `enable`, `disable [--rotate]` (destroys the old key so re-enabling cannot revive it), `cap`, `remove`, `listen <host> <port>|off`, `list [--json]`. Each write is a locked read-modify-write followed by a reload of the running server.
+Manage keys with `teamclaude guest`: `add <name> --account <acct> --cap <N|unlimited> [--key-file F]` prints (or writes, mode 600) the new key once; `rotate`, `enable`, `disable [--rotate]` (destroys the old key so re-enabling cannot revive it), `cap`, `remove`, `listen <host> <port>|off`, `list [--json]`. Each write is a locked read-modify-write followed by a reload of the running server.
 
 ## Environment variables
 
