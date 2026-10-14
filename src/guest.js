@@ -181,7 +181,12 @@ export function mediaMinimum(node, depth = 0) {
   if (o.type === 'document' && o.source?.media_type === 'application/pdf') {
     let pages = 0;
     if (typeof o.source.data === 'string') {
-      try { pages = (Buffer.from(o.source.data, 'base64').toString('latin1').match(/\/Type\s*\/Page(?!s)/g) || []).length; } catch { pages = 0; }
+      try {
+        const pdf = Buffer.from(o.source.data, 'base64').toString('latin1');
+        // Pages inside compressed object streams cannot be counted from the
+        // bytes: such a PDF gets the unknown-length floor.
+        pages = /\/ObjStm\b/.test(pdf) ? 0 : (pdf.match(/\/Type\s*\/Page(?!s)/g) || []).length;
+      } catch { pages = 0; }
     }
     n += pages > 0 ? pages * PDF_PAGE_TOKENS : PDF_UNKNOWN_TOKENS;
   }
@@ -224,16 +229,24 @@ export function findRemoteSource(node, depth = 0) {
 }
 
 /**
- * Betas a guest may send: the ones Claude Code uses for an ordinary session
- * (matched up to their date). Everything else is dropped, notably context-1m
- * (the reservation is sized for the standard window), files/MCP/threads/
- * managed agents (input stored server-side), web search/advisor, cache
- * keep-alive, fast mode and server-side fallbacks (spend the cap cannot see).
+ * Betas a guest may send: EXACT names, the ones the installed Claude Code
+ * (2.1.29x, 2026-10) uses for an ordinary session. A new beta, even one
+ * sharing a prefix with these, is dropped until it is added here. Dropped
+ * on purpose: context-1m (the reservation is sized for the standard window),
+ * files/MCP/threads/managed agents (input stored server-side), web search /
+ * advisor, cache keep-alive, fast mode, server-side fallbacks (spend the cap
+ * cannot see). Refresh: strings $(readlink -f $(which claude)) | grep -oE
+ * '"[a-z0-9-]+-20[0-9]{2}-?[0-9]{2}-?[0-9]{2}"' | sort -u, then pick.
  */
-export const GUEST_BETA_PREFIXES = ['claude-code-', 'oauth-', 'interleaved-thinking-', 'context-management-', 'effort-',
-  'fine-grained-tool-streaming-', 'token-counting-', 'structured-outputs-', 'prompt-caching-scope-', 'redact-thinking-',
-  'thinking-', 'mid-conversation-', 'per-turn-control-', 'timing-', 'cache-diagnosis-', 'inline-tools-',
-  'extended-cache-ttl-', 'advanced-tool-use-'];
+export const GUEST_BETAS = new Set([
+  'claude-code-20250219', 'oauth-2025-04-20', 'interleaved-thinking-2025-05-14', 'context-management-2025-06-27',
+  'effort-2025-11-24', 'token-counting-2024-11-01', 'structured-outputs-2025-12-15', 'prompt-caching-scope-2026-01-05',
+  'redact-thinking-2026-02-12', 'thinking-binding-controls-2026-08-01', 'thinking-display-updates-2026-08-18',
+  'thinking-resumption-2026-07-17', 'thinking-token-count-2026-05-13', 'mid-conversation-system-2026-04-07',
+  'mid-conversation-system-clear-at-2026-08-21', 'mid-conversation-tool-changes-2026-07-01', 'per-turn-control-2026-07-01',
+  'timing-2026-09-09', 'cache-diagnosis-2026-04-07', 'inline-tools-2026-09-15', 'extended-cache-ttl-2025-04-11',
+  'advanced-tool-use-2025-11-20',
+]);
 
 /**
  * The anthropic-beta value a guest request is forwarded with: only allow-listed
@@ -243,9 +256,8 @@ export const GUEST_BETA_PREFIXES = ['claude-code-', 'oauth-', 'interleaved-think
  * @param {unknown} value @param {{ oauth?: boolean }} [opts] @returns {string|undefined}
  */
 export function guestBetas(value, { oauth = false } = {}) {
-  const kept = String(value ?? '').split(',').map(x => x.trim().toLowerCase())
-    .filter(x => x && GUEST_BETA_PREFIXES.some(p => x.startsWith(p)));
-  if (oauth && !kept.some(x => x.startsWith('oauth-'))) kept.push(OAUTH_BETA);
+  const kept = String(value ?? '').split(',').map(x => x.trim().toLowerCase()).filter(x => GUEST_BETAS.has(x));
+  if (oauth && !kept.includes(OAUTH_BETA)) kept.push(OAUTH_BETA);
   return kept.length ? [...new Set(kept)].join(',') : undefined;
 }
 export const OAUTH_BETA = 'oauth-2025-04-20';
