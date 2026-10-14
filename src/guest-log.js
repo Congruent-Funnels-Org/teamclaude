@@ -30,10 +30,16 @@ export const GUEST_LOG_DEFAULTS = {
   maxMB: 5000,
   pruneEveryMs: 24 * 3600_000,
   maxQueuedBytes: 64 * 1024 * 1024, // held while the file opens; more is dropped
+  // A refused request costs the guest nothing, so its logging is capped per
+  // guest per UTC day: past either limit it is only counted (refused-not-logged.json).
+  refusedPerDay: 200,
+  refusedBytesPerDay: 16 * 1024 * 1024,
+  refusedBodyBytes: 64 * 1024,
 };
 
 // Only files this module writes are ever deleted.
-const LOG_FILE_RE = /^\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)$/;
+const LOG_FILE_RE = /^(\d{6}-[0-9a-f]{8}\.(req\.json|meta\.json|res\.sse)|refused-not-logged\.json)$/;
+export const SKIPPED_FILE = 'refused-not-logged.json';
 const SECRET_HEADERS = new Set(['authorization', 'x-api-key', 'proxy-authorization', 'cookie', 'set-cookie']);
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -129,14 +135,59 @@ function spend(config, dir, n, log) {
 }
 
 /**
- * Start the log of one guest request. Returns null when logging is off or the
- * size budget is spent. `chunk` takes response bytes as they arrive, `end`
- * closes the file. The body is written as the raw bytes received.
- * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
- *   truncatedFrom?: number|null, presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
- * @returns {{chunk: (b: Buffer) => void, end: () => void, reqPath: string, resPath: string, metaPath: string}|null}
+ * Refused-request logging per guest per UTC day: { entries, bytes, skipped }.
+ * @type {Map<string, {day: string, dir: string, entries: number, bytes: number, skipped: number, fromDisk: number, timer: any}>}
  */
-export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, truncatedFrom = null, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
+const refusedDays = new Map();
+
+/** @param {string} dir the day folder @param {string} day */
+function refusedOf(dir, day) {
+  let q = refusedDays.get(dir);
+  if (!q) {
+    for (const [k, v] of refusedDays) if (v.day !== day) { if (v.timer) clearTimeout(v.timer); refusedDays.delete(k); }
+    q = { day, dir, entries: 0, bytes: 0, skipped: 0, fromDisk: 0, timer: null };
+    refusedDays.set(dir, q);
+    // A restart keeps counting from what the file already says.
+    const rq = q;
+    readFile(join(dir, SKIPPED_FILE), 'utf8').then(t => { rq.fromDisk = Number(JSON.parse(t)?.count) || 0; }).catch(() => {});
+  }
+  return q;
+}
+
+/** Note one more refused request not logged; the file is written at most every 2 s. */
+/** @param {{dir: string, skipped: number, fromDisk: number, timer: any}} q */
+function noteSkipped(q) {
+  q.skipped += 1;
+  if (q.timer) return;
+  q.timer = setTimeout(() => {
+    q.timer = null;
+    mkdir(q.dir, { recursive: true, mode: 0o700 })
+      .then(() => writeFile(join(q.dir, SKIPPED_FILE), JSON.stringify({ count: q.fromDisk + q.skipped }), { mode: 0o600 }))
+      .catch(() => {});
+  }, 2000);
+  q.timer.unref?.();
+}
+
+/** For tests: forget the per-day refused counters. */
+export function resetGuestLogRefused() {
+  for (const v of refusedDays.values()) if (v.timer) clearTimeout(v.timer);
+  refusedDays.clear();
+}
+
+/**
+ * Start the log of one guest request. Returns null when logging is off.
+ * Nothing is written until `begin(refused)`: an accepted request (2xx answer)
+ * is logged in full; a refused one (refused here, or an error status from
+ * upstream: either costs the guest nothing) keeps the first 64 KB of its body
+ * and only up to refusedPerDay / refusedBytesPerDay per guest per UTC day,
+ * after which it is only counted. `chunk` takes response bytes as they arrive
+ * (held until begin), `end(status)` begins if needed and closes the file. The
+ * body is written as the raw bytes received.
+ * @param {{config: any, guest: string, method?: string, url?: string, headers?: Record<string, any>, body: Buffer,
+ *   presentedKey?: string|null, log?: (m: string) => void, now?: number, reqId?: string}} o
+ * @returns {{begin: (refused: boolean) => void, chunk: (b: Buffer) => void, end: (status?: number) => void, reqPath: string, resPath: string, metaPath: string}|null}
+ */
+export function openGuestLog({ config, guest, method = 'POST', url = '', headers = {}, body, presentedKey = null, log = console.log, now = Date.now(), reqId }) {
   if (!guestLogsEnabled(config)) return null;
   const base = guestLogDir(config);
   const at = new Date(now);
@@ -148,9 +199,7 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   const reqPath = join(dir, `${stem}.req.json`);
   const metaPath = join(dir, `${stem}.meta.json`);
   const resPath = join(dir, `${stem}.res.sse`);
-  const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url,
-    ...(truncatedFrom ? { bodyTruncatedFrom: truncatedFrom } : {}), headers: sanitizeHeaders(headers, presentedKey) });
-  if (!spend(config, base, body.length + meta.length, log)) return null;
+  const cleanHeaders = sanitizeHeaders(headers, presentedKey);
 
   let failed = false;
   const fail = (/** @type {any} */ err) => {
@@ -166,39 +215,84 @@ export function openGuestLog({ config, guest, method = 'POST', url = '', headers
   /** @type {Buffer[]} */
   let queue = [];
   let queued = 0;
+  let begun = false;
+  let dead = false;      // not logging this request (budget, refused cap, write error)
   let ended = false;
-  let full = false;
+  /** @type {ReturnType<typeof refusedOf>|null} */
+  let refusedQ = null;
   /** @type {import('node:fs').WriteStream|null} */
   let stream = null;
 
-  mkdir(dir, { recursive: true, mode: 0o700 })
-    .then(() => writeFile(metaPath, meta, { mode: 0o600, flag: 'wx' }))
-    .then(() => writeFile(reqPath, body, { mode: 0o600, flag: 'wx' }))
-    .then(() => {
-      if (failed) return;
-      stream = createWriteStream(resPath, { mode: 0o600, flags: 'wx' });
-      stream.on('error', fail);
-      for (const b of queue) stream.write(b);
-      queue = [];
-      if (ended) stream.end();
-    })
-    .catch(fail);
+  const write = (/** @type {Buffer} */ b) => {
+    // Refused requests' answers count against the guest's refused bytes too.
+    if (refusedQ) {
+      if (refusedQ.bytes + b.length > GUEST_LOG_DEFAULTS.refusedBytesPerDay) { dead = true; stream?.end(); return; }
+      refusedQ.bytes += b.length;
+    }
+    // The answer counts against the size budget; past it the file stops here.
+    if (!spend(config, base, b.length, log)) { dead = true; stream?.end(); return; }
+    if (stream) { stream.write(b); return; }
+    if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
+    queue.push(b);
+    queued += b.length;
+  };
+
+  const begin = (/** @type {boolean} */ refused) => {
+    if (begun) return;
+    begun = true;
+    const held = queue;
+    queue = []; queued = 0;
+    const cut = refused && body.length > GUEST_LOG_DEFAULTS.refusedBodyBytes;
+    const reqBody = cut ? body.subarray(0, GUEST_LOG_DEFAULTS.refusedBodyBytes) : body;
+    const meta = JSON.stringify({ at: iso, reqId: id, guest, method, url, ...(refused ? { refused: true } : {}),
+      ...(cut ? { bodyTruncatedFrom: body.length } : {}), headers: cleanHeaders });
+    const size = reqBody.length + meta.length;
+    if (refused) {
+      const q = refusedOf(dir, day);
+      if (q.entries >= GUEST_LOG_DEFAULTS.refusedPerDay || q.bytes + size > GUEST_LOG_DEFAULTS.refusedBytesPerDay) {
+        noteSkipped(q);
+        dead = true;
+        return;
+      }
+      q.entries += 1;
+      q.bytes += size;
+      refusedQ = q;
+    }
+    if (!spend(config, base, size, log)) { dead = true; return; }
+    for (const b of held) { if (dead) break; write(b); }
+    mkdir(dir, { recursive: true, mode: 0o700 })
+      .then(() => writeFile(metaPath, meta, { mode: 0o600, flag: 'wx' }))
+      .then(() => writeFile(reqPath, reqBody, { mode: 0o600, flag: 'wx' }))
+      .then(() => {
+        if (failed) return;
+        stream = createWriteStream(resPath, { mode: 0o600, flags: 'wx' });
+        stream.on('error', fail);
+        for (const b of queue) stream.write(b);
+        queue = [];
+        if (ended || dead) stream.end();
+      })
+      .catch(fail);
+  };
 
   return {
     reqPath,
     resPath,
     metaPath,
+    begin,
     chunk(b) {
-      if (failed || ended || full || !b?.length) return;
-      // The answer counts against the budget too; past it the file stops here.
-      if (!spend(config, base, b.length, log)) { full = true; return; }
-      if (stream) { stream.write(b); return; }
-      if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
-      queue.push(Buffer.from(b));
-      queued += b.length;
+      if (failed || ended || dead || !b?.length) return;
+      if (!begun) {
+        // Held until the status says how to log it; bounded like the open queue.
+        if (queued + b.length > GUEST_LOG_DEFAULTS.maxQueuedBytes) return;
+        queue.push(Buffer.from(b));
+        queued += b.length;
+        return;
+      }
+      write(Buffer.from(b));
     },
-    end() {
+    end(status) {
       if (ended) return;
+      if (!begun) begin(Number(status) >= 400);
       ended = true;
       if (stream) stream.end();
     },
@@ -223,10 +317,19 @@ async function dirBytes(p) {
  * @param {string} path
  */
 async function removeDay(path) {
+  let freed = 0;
   let entries;
-  try { entries = await readdir(path, { withFileTypes: true }); } catch { return; }
-  for (const e of entries) if (e.isFile() && LOG_FILE_RE.test(e.name)) await rm(join(path, e.name), { force: true });
-  try { await rmdir(path); } catch { /* not empty: foreign files stay */ }
+  try { entries = await readdir(path, { withFileTypes: true }); } catch { return { freed, gone: false }; }
+  for (const e of entries) {
+    if (!e.isFile() || !LOG_FILE_RE.test(e.name)) continue;
+    const f = join(path, e.name);
+    try {
+      const size = (await stat(f)).size;
+      await rm(f);
+      freed += size;
+    } catch { /* not ours to remove after all */ }
+  }
+  try { await rmdir(path); return { freed, gone: true }; } catch { return { freed, gone: false }; /* foreign files stay */ }
 }
 
 // Size backstop with a gap: past HIGH of logMaxMB a prune frees down to LOW,
@@ -237,13 +340,14 @@ export const PRUNE_LOW = 0.8;
 
 /**
  * Remove day folders older than retentionDays; then, when the whole log is
- * over 90% of maxMB, the oldest days until it is at most 80% (other days
- * first, today's last). Only folders named as guestDirName names them (a
+ * over 90% of maxMB, the oldest days until it is at most 80%. Today's folders
+ * are kept unless today alone is over maxMB: then logging pauses for the day
+ * (the budget) instead of erasing what today's requests did. Only folders named as guestDirName names them (a
  * removed guest's too), only YYYY-MM-DD folders in them, only this module's
  * own files, never through a symlink, so a mistaken logDir (~, /) can never
  * lose anything else.
  * @param {{dir: string, retentionDays?: number, maxMB?: number, now?: number}} o
- * @returns {Promise<{removed: string[], bytes: number}>}
+ * @returns {Promise<{removed: string[], bytes: number, freed: number}>}
  */
 export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.retentionDays, maxMB = GUEST_LOG_DEFAULTS.maxMB, now = Date.now() }) {
   /** @type {string[]} */
@@ -251,7 +355,15 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
   /** @type {{path: string, day: string, bytes: number}[]} */
   const days = [];
   let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0 }; }
+  let freed = 0;
+  /** Remove a day's files; the bytes that actually went. @param {string} path */
+  const drop = async (path) => {
+    const r = await removeDay(path);
+    freed += r.freed;
+    if (r.gone) removed.push(path);
+    return r.freed;
+  };
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return { removed, bytes: 0, freed }; }
   const cutoff = new Date(now - retentionDays * 86_400_000).toISOString().slice(0, 10);
   for (const g of entries) {
     if (!g.isDirectory() || guestDirName(g.name) !== g.name) continue;
@@ -260,7 +372,7 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
     for (const d of ds) {
       if (!d.isDirectory() || !DAY_RE.test(d.name)) continue;
       const path = join(dir, g.name, d.name);
-      if (d.name < cutoff) { await removeDay(path); removed.push(path); continue; }
+      if (d.name < cutoff) { await drop(path); continue; }
       days.push({ path, day: d.name, bytes: await dirBytes(path) });
     }
   }
@@ -268,16 +380,17 @@ export async function pruneGuestLogs({ dir, retentionDays = GUEST_LOG_DEFAULTS.r
   const limit = maxMB * 1024 * 1024;
   if (bytes > limit * PRUNE_HIGH) {
     const today = new Date(now).toISOString().slice(0, 10);
-    // Oldest first, today's folders after every older one.
-    days.sort((a, b) => ((a.day === today) - (b.day === today)) || (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
-    for (const d of days) {
+    const todays = days.filter(d => d.day >= today);
+    const todayBytes = todays.reduce((s, d) => s + d.bytes, 0);
+    // Oldest first; today's only when today alone is over the cap.
+    const order = days.filter(d => d.day < today).sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    if (todayBytes > limit) order.push(...todays);
+    for (const d of order) {
       if (bytes <= limit * PRUNE_LOW) break;
-      await removeDay(d.path);
-      removed.push(d.path);
-      bytes -= d.bytes;
+      bytes -= await drop(d.path);
     }
   }
-  return { removed, bytes };
+  return { removed, bytes, freed };
 }
 
 /** @type {Set<string>} dirs with a prune running */
@@ -299,7 +412,7 @@ export function runGuestLogPrune(config, log = console.log) {
   return pruneGuestLogs({ dir, retentionDays: days, maxMB: maxBytesOf(config) / 1048576 })
     .then(r => {
       // Still full after a prune that freed nothing: stay quiet about it.
-      setGuestLogBytes(dir, r.bytes, { keepFull: r.removed.length === 0 && r.bytes >= maxBytesOf(config) * PRUNE_HIGH });
+      setGuestLogBytes(dir, r.bytes, { keepFull: r.freed === 0 && r.bytes >= maxBytesOf(config) * PRUNE_HIGH });
       if (r.removed.length) log(`[TeamClaude] guest logs: pruned ${r.removed.length} day folder(s)`);
     })
     .catch(err => { try { log(`[TeamClaude] guest logs: prune failed (${err?.message || err})`); } catch { /* nothing */ } })
@@ -393,6 +506,10 @@ export async function renderGuestTranscript({ dir, guest, date = null }) {
   const files = (await readdir(join(gdir, day))).filter(f => f.endsWith('.req.json')).sort();
   const n = (/** @type {any} */ v) => Number(v || 0).toLocaleString('en-US');
   const out = [`Guest "${guest}", ${day} (UTC): ${files.length} request(s)`];
+  try {
+    const skipped = Number(JSON.parse(await readFile(join(gdir, day, SKIPPED_FILE), 'utf8'))?.count) || 0;
+    if (skipped) out.push(`${n(skipped)} refused request(s) not logged (over the daily refused-log cap)`);
+  } catch { /* none */ }
   for (const f of files) {
     const stem = f.slice(0, -'.req.json'.length);
     /** @type {any} */

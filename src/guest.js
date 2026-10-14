@@ -697,8 +697,9 @@ function sendJson(res, status, type, message, extra = {}) {
  * @param {any} res
  * @param {() => string[]} identifiers account names/emails to keep out of error text
  * @param {((b: Buffer) => void)|null} [tap] sees every body byte as the forwarder wrote it (the guest stream log)
+ * @param {((status: number) => void)|null} [onStatus] told the status before any body byte
  */
-function guardResponse(res, identifiers, tap = null) {
+function guardResponse(res, identifiers, tap = null, onStatus = null) {
   const setHeader = res.setHeader.bind(res);
   res.setHeader = (/** @type {string} */ name, /** @type {any} */ value) => (isAllowedResponseHeader(name) ? setHeader(name, value) : res);
   const writeHead = res.writeHead.bind(res);
@@ -722,6 +723,7 @@ function guardResponse(res, identifiers, tap = null) {
   };
   res.writeHead = (/** @type {number} */ code, /** @type {any[]} */ ...rest) => {
     status = code;
+    told(code);
     const args = rest.map(a => {
       if (!a || typeof a !== 'object') return a;
       if (Array.isArray(a)) {
@@ -742,7 +744,15 @@ function guardResponse(res, identifiers, tap = null) {
   };
   const asBuffer = (/** @type {any} */ chunk, /** @type {any} */ enc) => (Buffer.isBuffer(chunk) ? chunk
     : Buffer.from(String(chunk), /** @type {BufferEncoding} */ (typeof enc === 'string' ? enc : 'utf8')));
+  let toldStatus = false;
+  const told = (/** @type {number} */ code) => {
+    if (toldStatus) return;
+    toldStatus = true;
+    try { onStatus?.(code); } catch { /* logging never fails a request */ }
+  };
   const tapped = (/** @type {any} */ chunk, /** @type {any} */ enc) => {
+    // A body written without an explicit writeHead goes out with statusCode.
+    told(res.statusCode || 200);
     if (!tap || chunk == null || typeof chunk === 'function') return;
     try { tap(asBuffer(chunk, enc)); } catch { /* logging never fails a request */ }
   };
@@ -994,9 +1004,10 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       }
     };
     res.once('close', release);
-    res.once('close', () => entry?.end());
-    /** A refusal after the body was read: answered, and kept in the stream log. */
+    res.once('close', () => entry?.end(res.statusCode));
+    /** A refusal after the body was read: answered, and kept (capped) in the stream log. */
     const refuse = (/** @type {number} */ status, /** @type {string} */ type, /** @type {string} */ message, /** @type {Record<string, string>} */ extra = {}) => {
+      entry?.begin(true);
       entry?.chunk(Buffer.from(JSON.stringify({ type: 'error', error: { type, message } })));
       sendJson(res, status, type, message, extra);
     };
@@ -1008,15 +1019,15 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         req.destroy?.();
         return;
       }
+      // The request and, below, the answer as received (guest-log.js). How it
+      // is logged waits for the outcome: in full when answered, capped when
+      // refused (here or by upstream), since a refusal costs the guest nothing
+      // and must not be a way to fill the disk or push real requests out.
+      // Never blocks or fails the request.
+      entry = openGuestLog({ config, guest: name, method: req.method, url: req.url, headers: req.headers,
+        body, presentedKey: presentedGuestKey(req.headers), log });
       const pathname = new URL(req.url, 'http://guest.invalid').pathname;
       const checked = checkGuestBody(pathname, req.headers, body);
-      // The full request and, below, the full answer as received (guest-log.js).
-      // A refused body is kept to its first 64 KB: a refusal costs the guest
-      // nothing, so it must not be a way to fill the disk. Never blocks or
-      // fails the request.
-      entry = openGuestLog({ config, guest: name, method: req.method, url: req.url, headers: req.headers,
-        body: checked.ok ? body : body.subarray(0, REFUSED_LOG_BYTES), truncatedFrom: checked.ok || body.length <= REFUSED_LOG_BYTES ? null : body.length,
-        presentedKey: presentedGuestKey(req.headers), log });
       if (!checked.ok) {
         const bad = /** @type {{status: number, type: string, message: string}} */ (/** @type {unknown} */ (checked));
         refuse(bad.status, bad.type, bad.message);
@@ -1043,7 +1054,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       if (beta === undefined) delete req.headers['anthropic-beta'];
       else req.headers['anthropic-beta'] = beta;
       const log1 = entry;
-      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null);
+      guardResponse(res, identifiers, log1 ? (b) => log1.chunk(b) : null, log1 ? (code) => log1.begin(code >= 400) : null);
       guestUsage.recordRequest(name);
       // The body is already read; the forwarder reads it again from this copy.
       const replay = /** @type {any} */ (Readable.from(body.length ? [body] : []));
@@ -1114,7 +1125,6 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
   return Object.assign(handler, { dispose: unsubscribe });
 }
 
-export const REFUSED_LOG_BYTES = 64 * 1024;
 export const DAILY_LIMIT_MESSAGE = 'Daily limit reached. It resets at 00:00 UTC.';
 
 /** @param {number} [ms] */

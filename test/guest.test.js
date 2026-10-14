@@ -1255,7 +1255,7 @@ test('stream log prune: retention days, then past 90% of logMaxMB down to 80% (o
     assert.equal(existsSync(join(dir, 'other', '2026-10-12')), false);  // and the next, down to 80%
     assert.equal(existsSync(join(dir, 'nephew', '2026-10-15')), true);  // today's last
     assert.equal(existsSync(join(dir, 'nephew', 'not-a-day')), true);
-    assert.equal(r.removed.length, 4);
+    assert.equal(r.removed.length, 3);   // other/2026-01-01 keeps notes.txt, so the folder stays and is not listed
     assert.ok(r.bytes <= 0.8 * 1024 * 1024);
     assert.deepEqual((await pruneGuestLogs({ dir: join(dir, 'missing') })).removed, []);
     // a removed guest's folder is still pruned; a symlinked folder is never followed
@@ -1268,11 +1268,18 @@ test('stream log prune: retention days, then past 90% of logMaxMB down to 80% (o
     assert.equal(existsSync(join(dir, 'stranger', '2020-01-01')), false);
     assert.equal(readFileSync(join(outside, '2020-01-01', '000000-aaaaaaaa.res.sse'), 'utf8'), 'keep');
     rmSync(outside, { recursive: true, force: true });
-    // over 90% with only today's folder: it goes too, so logging can resume
+    // over 90% with only today's folder: kept (logging pauses for the day) ...
     const solo = mkdtempSync(join(tmpdir(), 'tc-guest-solo-'));
     mkdirSync(join(solo, 'nephew', '2026-10-15'), { recursive: true });
     writeFileSync(join(solo, 'nephew', '2026-10-15', '000000-aaaaaaaa.res.sse'), Buffer.alloc(1_000_000));
-    assert.equal((await pruneGuestLogs({ dir: solo, maxMB: 1, now })).bytes, 0);
+    const kept = await pruneGuestLogs({ dir: solo, maxMB: 1, now });
+    assert.equal(kept.bytes, 1_000_000);
+    assert.equal(kept.freed, 0);
+    // ... unless today alone is over the cap
+    writeFileSync(join(solo, 'nephew', '2026-10-15', '000000-bbbbbbbb.res.sse'), Buffer.alloc(200_000));
+    const gone = await pruneGuestLogs({ dir: solo, maxMB: 1, now });
+    assert.equal(gone.bytes, 0);
+    assert.equal(gone.freed, 1_200_000);
     rmSync(solo, { recursive: true, force: true });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1342,7 +1349,9 @@ test('stream logs: past logMaxMB the running count stops all writing (one line) 
     const logs = [];
     setGuestLogBytes(dir, 1024 * 1024 - 10);              // 10 bytes left of 1 MB
     for (let i = 0; i < 3; i++) {
-      assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"a":1}'), log: m => logs.push(m) }), null);
+      const e0 = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"a":1}'), log: m => logs.push(m) });
+      e0.chunk(Buffer.from('answer'));
+      e0.end(200);
     }
     assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1, logs.join('\n'));
     await new Promise(res => setTimeout(res, 100));        // the kicked prune measured the (empty) log
@@ -1352,6 +1361,7 @@ test('stream logs: past logMaxMB the running count stops all writing (one line) 
     setGuestLogBytes(dir, 1024 * 1024 - 400);
     const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"a":1}'), log: m => logs.push(m) });
     assert.ok(e);
+    e.begin(false);
     e.chunk(Buffer.alloc(100, 97));
     e.chunk(Buffer.alloc(1000, 98));                       // over: dropped, and nothing after it
     e.chunk(Buffer.alloc(10, 99));
@@ -1413,11 +1423,77 @@ test('stream logs: a prune that frees nothing keeps the budget full and quiet', 
     chmodSync(day, 0o500);
     const logs = [];
     setGuestLogBytes(dir, 1024 * 1024);
-    assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }), null);
+    openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }).end(200);
     await new Promise(res => setTimeout(res, 50));
     await runGuestLogPrune(config, m => logs.push(m));
     await runGuestLogPrune(config, m => logs.push(m));
-    assert.equal(openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }), null);
+    openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }).end(200);
+    assert.ok(!logs.some(l => /pruned/.test(l)), logs.join('\n'));
     assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1, logs.join('\n'));
   } finally { try { chmodSync(day, 0o700); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: 1000 refused bodies log at most the refused cap; an older day survives; real requests still logged in full', { timeout: 120_000 }, async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { GUEST_LOG_DEFAULTS } = await import('../src/guest-log.js');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-refused-cap-'));
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  mkdirSync(join(dir, 'nephew', yesterday), { recursive: true });
+  writeFileSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json'), '{"real":"yesterday"}');
+  try {
+    await withGuest(async ({ port }) => {
+      const bad = JSON.stringify({ model: 'm', max_tokens: 5, tools: [{ type: 'code_execution_20250825', name: 'c' }], messages: [{ role: 'user', content: 'y'.repeat(100_000) }] });
+      for (let i = 0; i < 1000; i++) {
+        const r = await ask(port, { body: bad });
+        assert.equal(r.status, 400);
+        await r.text();
+      }
+      const good = await ask(port); await good.text();
+      assert.equal(good.status, 200);
+      await new Promise(res => setTimeout(res, 2300));   // the skipped counter is written every 2 s
+      const today = new Date().toISOString().slice(0, 10);
+      const tdir = join(dir, 'nephew', today);
+      const files = readdirSync(tdir);
+      let bytes = 0;
+      for (const f of files) bytes += statSync(join(tdir, f)).size;
+      assert.ok(bytes <= GUEST_LOG_DEFAULTS.refusedBytesPerDay + 200_000, String(bytes));
+      const metas = files.filter(f => f.endsWith('.meta.json')).map(f => JSON.parse(readFileSync(join(tdir, f), 'utf8')));
+      const refused = metas.filter(m => m.refused);
+      assert.ok(refused.length <= GUEST_LOG_DEFAULTS.refusedPerDay, String(refused.length));
+      assert.equal(metas.filter(m => !m.refused).length, 1);        // the real one, in full
+      const skipped = JSON.parse(readFileSync(join(tdir, 'refused-not-logged.json'), 'utf8')).count;
+      assert.equal(skipped + refused.length, 1000);
+      assert.equal(statSync(join(tdir, 'refused-not-logged.json')).mode & 0o777, 0o600);
+      assert.equal(existsSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json')), true);
+      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), new RegExp(`${skipped} refused request\\(s\\) not logged`));
+    }, { guests: { ...guestsConfig({ requestsPerMinute: 5000 }), logDir: dir, logMaxMB: 20 } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: an upstream error answer is logged as refused (body capped to 64 KB)', async () => {
+  const { mkdtempSync, readdirSync, readFileSync, statSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-upstream-err-'));
+  const reject = (req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'model: not found' } }));
+  };
+  try {
+    await withGuest(async ({ port }) => {
+      const body = JSON.stringify({ model: 'nope', max_tokens: 5, messages: [{ role: 'user', content: 'z'.repeat(500_000) }] });
+      const r = await ask(port, { body }); await r.text();
+      assert.equal(r.status, 400);
+      await new Promise(res => setTimeout(res, 100));
+      const tdir = join(dir, 'nephew', readdirSync(join(dir, 'nephew'))[0]);
+      const req = readdirSync(tdir).find(f => f.endsWith('.req.json'));
+      assert.ok(statSync(join(tdir, req)).size <= 64 * 1024);
+      const meta = JSON.parse(readFileSync(join(tdir, req.replace('.req.json', '.meta.json')), 'utf8'));
+      assert.equal(meta.refused, true);
+      assert.equal(meta.bodyTruncatedFrom, Buffer.byteLength(body));
+      assert.match(readFileSync(join(tdir, req.replace('.req.json', '.res.sse')), 'utf8'), /model: not found/);
+    }, { upstreamFor: { ai: reject }, guests: { ...guestsConfig(), logDir: dir } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
