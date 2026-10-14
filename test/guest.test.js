@@ -48,7 +48,7 @@ function oauth(name) {
 const KEY = 'tcg-test-key-0123456789';
 
 function guestsConfig(extra = {}) {
-  return { keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai', dailyTokenCap: 'unlimited', enabled: true, ...extra }] };
+  return { keys: [{ name: 'phoebe', keyHash: hashGuestKey(KEY), account: 'ai', dailyTokenCap: 'unlimited', enabled: true, ...extra }] };
 }
 
 // ── units ────────────────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ test('hashGuestKey is sha256 hex; newGuestKey is prefixed and random', () => {
 
 test('resolveGuestKey matches the hash, ignores disabled and malformed entries', () => {
   const g = guestsConfig();
-  assert.equal(resolveGuestKey(g, KEY)?.name, 'nephew');
+  assert.equal(resolveGuestKey(g, KEY)?.name, 'phoebe');
   assert.equal(resolveGuestKey(g, KEY + 'x'), null);
   assert.equal(resolveGuestKey(g, ''), null);
   assert.equal(resolveGuestKey(g, null), null);
@@ -152,7 +152,7 @@ test('GuestUsageTracker resets "today" on a new UTC day and keeps lifetime total
 
 test('guestStatus shows counters and never a key or hash', () => {
   const s = guestStatus({ guests: { listen: { host: 'h', port: 1 }, ...guestsConfig({ dailyTokenCap: 5 }) } }, new GuestUsageTracker());
-  assert.equal(s.keys[0].name, 'nephew');
+  assert.equal(s.keys[0].name, 'phoebe');
   assert.equal(s.keys[0].dailyTokenCap, 5);
   assert.ok(!JSON.stringify(s).includes(hashGuestKey(KEY)));
 });
@@ -213,8 +213,8 @@ test('a guest request is served by its pinned account with the account token, gu
     assert.equal(res.headers.get('set-cookie'), null);
     assert.equal(res.headers.get('x-ok'), null);   // not on the allow-list
     // input + output + cache read + cache write
-    assert.equal(guestUsage.tokensToday('nephew'), 135);
-    assert.equal(guestUsage.get('nephew').requestsToday, 1);
+    assert.equal(guestUsage.tokensToday('phoebe'), 135);
+    assert.equal(guestUsage.get('phoebe').requestsToday, 1);
   });
 });
 
@@ -322,7 +322,7 @@ test('the daily cap answers 429 once reached, before anything is sent', async ()
     const first = await ask(port);
     await first.text();
     assert.equal(first.status, 200);
-    assert.ok(guestUsage.tokensToday('nephew') >= 100);
+    assert.ok(guestUsage.tokensToday('phoebe') >= 100);
     const second = await ask(port);
     const body = await second.json();
     assert.equal(second.status, 429);
@@ -344,7 +344,7 @@ test('streaming usage (message_start + message_delta) is booked, cache included'
     await res.text();
     assert.equal(res.status, 200);
     // 7 input + 43 cache (counted once, at message_start) + 9 output
-    assert.equal(guestUsage.tokensToday('nephew'), 59);
+    assert.equal(guestUsage.tokensToday('phoebe'), 59);
   }, { upstreamFor: { ai: sse } });
 });
 
@@ -457,10 +457,10 @@ test('startGuestListener binds the configured address', async () => {
 test('teamclaude status renders a Guests section', async () => {
   const { renderStatus } = await import('../src/status-renderer.js');
   const out = renderStatus({ accounts: [], guests: { listen: { host: '100.99.200.17', port: 3460 }, listening: { listening: false, error: 'EADDRNOTAVAIL' },
-    keys: [{ name: 'nephew', account: 'ai@x', enabled: true, dailyTokenCap: 3000000, tokensToday: 1234, requestsToday: 2, lastSeen: null }] } }, { color: false });
+    keys: [{ name: 'phoebe', account: 'ai@x', enabled: true, dailyTokenCap: 3000000, tokensToday: 1234, requestsToday: 2, lastSeen: null }] } }, { color: false });
   const text = Array.isArray(out) ? out.join('\n') : out;
   assert.match(text, /Guests 100\.99\.200\.17:3460, not listening \(EADDRNOTAVAIL\)/);
-  assert.match(text, /nephew {2}enabled {2}→ ai@x {2}1,234\/3,000,000 tokens today, 2 req/);
+  assert.match(text, /phoebe {2}enabled {2}→ ai@x {2}1,234\/3,000,000 tokens today, 2 req/);
 });
 
 // ── bounce 1: caps, limits, leaks ───────────────────────────────────────────
@@ -492,7 +492,7 @@ test('parallel requests at the cap edge cannot all slip under it', async () => {
     assert.ok(statuses.filter(s => s === 200).length <= 2, statuses.join(','));
     assert.ok(statuses.includes(429), statuses.join(','));
     assert.ok(seen.length <= 2);
-    assert.ok(guestUsage.tokensToday('nephew') <= 120 + 50, String(guestUsage.tokensToday('nephew')));
+    assert.ok(guestUsage.tokensToday('phoebe') <= 120 + 50, String(guestUsage.tokensToday('phoebe')));
   }, { upstreamFor: { ai: slow }, guests: guestsConfig({ dailyTokenCap: 120, maxConcurrent: 5 }) });
 });
 
@@ -592,7 +592,7 @@ test('a guest session id is namespaced before routing', async () => {
   await withGuest(async ({ port }) => {
     const res = await ask(port, { headers: { 'x-claude-code-session-id': 'jans-session-1' } });
     await res.text();
-    assert.deepEqual(sessions, ['guest:nephew:jans-session-1']);
+    assert.deepEqual(sessions, ['guest:phoebe:jans-session-1']);
   }, { hooks: { onRequestStart: (_id, info) => sessions.push(info.sessionId) } });
 });
 
@@ -630,7 +630,7 @@ test('an answer cut short before message_delta is booked at its worst case', asy
     ac.abort();
     await new Promise(r => setTimeout(r, 150));
     // 7 input from message_start + the full 1000 output it was allowed
-    assert.ok(guestUsage.tokensToday('nephew') >= 1007, String(guestUsage.tokensToday('nephew')));
+    assert.ok(guestUsage.tokensToday('phoebe') >= 1007, String(guestUsage.tokensToday('phoebe')));
   }, { upstreamFor: { ai: hang } });
 });
 
@@ -644,7 +644,7 @@ test('input a server-side round adds after message_start is booked from message_
   await withGuest(async ({ port, guestUsage }) => {
     const res = await ask(port);
     await res.text();
-    assert.equal(guestUsage.tokensToday('nephew'), 90005);
+    assert.equal(guestUsage.tokensToday('phoebe'), 90005);
   }, { upstreamFor: { ai: grow } });
 });
 
@@ -769,7 +769,7 @@ test('a long-context beta is stripped before forwarding; other betas pass', asyn
 
 test('a capped-out key gets its 429 before the body is read', async () => {
   const usage = new GuestUsageTracker();
-  usage.recordTokens('nephew', 500);
+  usage.recordTokens('phoebe', 500);
   await withGuest(async ({ port, seen }) => {
     const status = await new Promise((resolve, reject) => {
       const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
@@ -799,14 +799,14 @@ test('prompt-cache figures reach the guest as 0 but are booked in full', async (
     assert.match(text, /"cache_read_input_tokens":0/);
     assert.match(text, /"ephemeral_5m_input_tokens":0/);
     assert.match(text, /"input_tokens":7/);
-    assert.equal(guestUsage.tokensToday('nephew'), 59);
+    assert.equal(guestUsage.tokensToday('phoebe'), 59);
   }, { upstreamFor: { ai: sse } });
   const json = (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":1000}}'); };
   await withGuest(async ({ port, guestUsage }) => {
     const res = await ask(port);
     const body = await res.json();
     assert.equal(body.usage.cache_read_input_tokens, 0);
-    assert.equal(guestUsage.tokensToday('nephew'), 1005);
+    assert.equal(guestUsage.tokensToday('phoebe'), 1005);
   }, { upstreamFor: { ai: json } });
   assert.equal(zeroCacheFigures('{"cache_read_input_tokens" : 12}'), '{"cache_read_input_tokens" : 0}');
 });
@@ -865,7 +865,7 @@ test('usage.iterations[] is booked when it exceeds the top-level figures (buffer
     res.end(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5, iterations: [{ input_tokens: 50000, output_tokens: 2000 }, { input_tokens: 10, output_tokens: 5 }] } })); };
   await withGuest(async ({ port, guestUsage }) => {
     const r = await ask(port); await r.text();
-    assert.equal(guestUsage.tokensToday('nephew'), 52015);
+    assert.equal(guestUsage.tokensToday('phoebe'), 52015);
   }, { upstreamFor: { ai: body } });
   const sse = (req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -875,12 +875,12 @@ test('usage.iterations[] is booked when it exceeds the top-level figures (buffer
   };
   await withGuest(async ({ port, guestUsage }) => {
     const r = await ask(port); await r.text();
-    assert.equal(guestUsage.tokensToday('nephew'), 31015);
+    assert.equal(guestUsage.tokensToday('phoebe'), 31015);
   }, { upstreamFor: { ai: sse } });
   // without iterations nothing changes
   await withGuest(async ({ port, guestUsage }) => {
     const r = await ask(port); await r.text();
-    assert.equal(guestUsage.tokensToday('nephew'), 135);
+    assert.equal(guestUsage.tokensToday('phoebe'), 135);
   });
 });
 
@@ -995,16 +995,16 @@ test('share % = weekly rise today × guest weighted / account weighted', () => {
   const t = new GuestUsageTracker({ now: () => now });
   t.observeWeekly('ai', 0.20, Date.UTC(2026, 9, 20), now);       // baseline
   t.recordAccountWeighted('ai', 1000);
-  t.recordGuestWeighted('nephew', 250);
+  t.recordGuestWeighted('phoebe', 250);
   now += 60_000;
   t.observeWeekly('ai', 0.60, Date.UTC(2026, 9, 20), now);       // +40 points
-  const s = t.share('nephew', 'ai');
+  const s = t.share('phoebe', 'ai');
   assert.equal(s.stale, false);
   assert.ok(Math.abs(s.pct - 10) < 1e-9, String(s.pct));         // 40 × 0.25
   assert.ok(Math.abs(s.risePct - 40) < 1e-9);
   // an older reading never rewinds
   t.observeWeekly('ai', 0.30, Date.UTC(2026, 9, 20), now - 30_000);
-  assert.ok(Math.abs(t.share('nephew', 'ai').pct - 10) < 1e-9);
+  assert.ok(Math.abs(t.share('phoebe', 'ai').pct - 10) < 1e-9);
 });
 
 test('share %: a weekly reset inside the day keeps what was used before it', () => {
@@ -1045,7 +1045,7 @@ test('share %: a drop while the old window still runs is a lagging reading, not 
 test('share %: after a reading gap (days off, a weekly reset between) the next reading is a baseline, no false lock', () => {
   let now = Date.UTC(2026, 9, 10, 20, 0);
   const t = new GuestUsageTracker({ now: () => now });
-  t.observeWeekly('ai', 0.10, Date.UTC(2026, 9, 12), now);       // last reading before `nephew off`
+  t.observeWeekly('ai', 0.10, Date.UTC(2026, 9, 12), now);       // last reading before `phoebe off`
   // three days later, same weekly window gone and a new one at 70%
   now = Date.UTC(2026, 9, 13, 9, 0);
   t.recordAccountWeighted('ai', 10); t.recordGuestWeighted('n', 10);
@@ -1132,7 +1132,7 @@ test('lock: once the share reaches the cap the guest gets 429 + retry-after to 0
     assert.equal(body.error.message, 'Daily limit reached. It resets at 00:00 UTC.');
     const ra = Number(r3.headers.get('retry-after'));
     assert.ok(ra > 0 && Math.abs(ra - secondsToUtcMidnight()) <= 2, String(ra));
-    assert.equal(guestUsage.lockedToday('nephew'), true);
+    assert.equal(guestUsage.lockedToday('phoebe'), true);
     assert.ok(logs.some(l => /daily usage cap reached \(40\.0%/.test(l)), logs.join('\n'));
     assert.ok(persisted >= 1);
     // stays locked even if the share would now read lower
@@ -1216,10 +1216,10 @@ test('stream logs: finished entries are gzipped 0600 in 0700 dirs with .done las
       assert.equal(r.status, 200);
       assert.match(got, /"cache_read_input_tokens":0/);
       assert.match(got, /"cache_missed_input_tokens":0/);        // L1: zeroed for the guest
-      const ddir = join(dir, 'nephew', todayUtc());
+      const ddir = join(dir, 'phoebe', todayUtc());
       await waitFor(() => doneCount(ddir) === 1);
       assert.equal(statSync(dir).mode & 0o777, 0o700);
-      assert.equal(statSync(join(dir, 'nephew')).mode & 0o777, 0o700);
+      assert.equal(statSync(join(dir, 'phoebe')).mode & 0o777, 0o700);
       assert.equal(statSync(ddir).mode & 0o777, 0o700);
       const files = readdirSync(ddir).sort();
       const stem = files.find(f => f.endsWith('.done')).slice(0, 15);
@@ -1238,7 +1238,7 @@ test('stream logs: finished entries are gzipped 0600 in 0700 dirs with .done las
       assert.equal(meta.headers['anthropic-beta'], 'web-search-2025-03-05,cache-diagnosis-2026-04-07');
       assert.equal(meta.headers['x-extra'], undefined);
       assert.match(gz(join(ddir, `${stem}.res.sse.gz`)), /"cache_read_input_tokens":900/);   // as received
-      const out = await renderGuestTranscript({ dir, guest: 'nephew' });
+      const out = await renderGuestTranscript({ dir, guest: 'phoebe' });
       assert.match(out, /USER: what is the weather/);
       assert.match(out, /ASSISTANT: Hello there/);
       assert.match(out, /TOOLS: web_search, Bash/);
@@ -1297,7 +1297,7 @@ test('fail closed: past the guest\'s daily log budget (logGuestMBPerDay) request
 
 test('fail closed: a full global budget refuses with 503 and kicks a prune that frees shipped entries', async () => {
   const dir = tmp('tc-guest-globalfull-');
-  const old = join(dir, 'nephew', '2026-01-02');
+  const old = join(dir, 'phoebe', '2026-01-02');
   mkdirSync(old, { recursive: true });
   writeFileSync(join(old, '010101-aaaaaaaa.res.sse.gz'), Buffer.alloc(1024 * 1024 - 100));
   writeFileSync(join(old, '010101-aaaaaaaa.done'), 'x');
@@ -1319,8 +1319,8 @@ test('fail closed: a full global budget refuses with 503 and kicks a prune that 
 test('unbilled cap: 1000 × 1 MB count_tokens and 1000 refused bodies log at most the cap; an older day survives; a real request is logged in full', { timeout: 120_000 }, async () => {
   const dir = tmp('tc-guest-unbilled-');
   const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  mkdirSync(join(dir, 'nephew', yesterday), { recursive: true });
-  writeFileSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json.gz'), gzipSync('{"real":"yesterday"}'));
+  mkdirSync(join(dir, 'phoebe', yesterday), { recursive: true });
+  writeFileSync(join(dir, 'phoebe', yesterday, '000000-aaaaaaaa.req.json.gz'), gzipSync('{"real":"yesterday"}'));
   const counter = (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(req.url.includes('count_tokens') ? JSON.stringify({ input_tokens: 333333 })
@@ -1343,7 +1343,7 @@ test('unbilled cap: 1000 × 1 MB count_tokens and 1000 refused bodies log at mos
       const realBody = JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'r'.repeat(200_000) }] });
       const real = await ask(port, { body: realBody }); await real.text();
       assert.equal(real.status, 200);
-      const tdir = join(dir, 'nephew', todayUtc());
+      const tdir = join(dir, 'phoebe', todayUtc());
       await waitFor(() => doneCount(tdir) >= GUEST_LOG_DEFAULTS.unbilledPerDay + 1, 20_000);
       await new Promise(r => setTimeout(r, 2300));                // day.json is saved every 2 s
       let bytes = 0;
@@ -1356,8 +1356,8 @@ test('unbilled cap: 1000 × 1 MB count_tokens and 1000 refused bodies log at mos
       assert.ok(metas.filter(x => x.m.unbilled).length <= GUEST_LOG_DEFAULTS.unbilledPerDay);
       const counts = JSON.parse(readFileSync(join(tdir, 'day.json'), 'utf8'));
       assert.equal(counts.unbilledEntries + counts.notLogged, 2000);
-      assert.equal(existsSync(join(dir, 'nephew', yesterday, '000000-aaaaaaaa.req.json.gz')), true);
-      assert.match(await renderGuestTranscript({ dir, guest: 'nephew' }), new RegExp(`${counts.notLogged.toLocaleString('en-US')} unbilled request\\(s\\)`));
+      assert.equal(existsSync(join(dir, 'phoebe', yesterday, '000000-aaaaaaaa.req.json.gz')), true);
+      assert.match(await renderGuestTranscript({ dir, guest: 'phoebe' }), new RegExp(`${counts.notLogged.toLocaleString('en-US')} unbilled request\\(s\\)`));
     }, { upstreamFor: { ai: counter }, guests: { ...guestsConfig({ requestsPerMinute: 5000 }), logDir: dir, logMaxMB: 50 } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1372,7 +1372,7 @@ test('an upstream error on /v1/messages is logged (status kept, marked unbilled)
     await withGuest(async ({ port }) => {
       const r = await ask(port); await r.text();
       assert.equal(r.status, 400);
-      const tdir = join(dir, 'nephew', todayUtc());
+      const tdir = join(dir, 'phoebe', todayUtc());
       await waitFor(() => doneCount(tdir) === 1);
       const f = readdirSync(tdir).find(x => x.endsWith('.meta.json.gz'));
       const meta = JSON.parse(gz(join(tdir, f)));
@@ -1386,12 +1386,12 @@ test('an upstream error on /v1/messages is logged (status kept, marked unbilled)
 test('the day counters (guest budget, unbilled cap) are seeded from day.json after a restart', async () => {
   const dir = tmp('tc-guest-seed-');
   const config = { guests: { logDir: dir } };
-  const tdir = join(dir, 'nephew', todayUtc());
+  const tdir = join(dir, 'phoebe', todayUtc());
   mkdirSync(tdir, { recursive: true });
   writeFileSync(join(tdir, 'day.json'), JSON.stringify({ allBytes: 10, unbilledEntries: GUEST_LOG_DEFAULTS.unbilledPerDay, unbilledBytes: 1000, notLogged: 7 }));
   try {
     resetGuestLogDays();
-    const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{}') });
+    const e = openGuestLog({ config, guest: 'phoebe', body: Buffer.from('{}') });
     assert.equal(await e.begin(true), 'counted');                  // already at the seeded cap
     const c = await guestLogDay(tdir);
     assert.equal(c.notLogged, 8);
@@ -1399,7 +1399,7 @@ test('the day counters (guest budget, unbilled cap) are seeded from day.json aft
     const big = { guests: { logDir: dir, logGuestMBPerDay: 1 } };
     writeFileSync(join(tdir, 'day.json'), JSON.stringify({ allBytes: 1024 * 1024 }));
     resetGuestLogDays();
-    const f = openGuestLog({ config: big, guest: 'nephew', body: Buffer.from('{}') });
+    const f = openGuestLog({ config: big, guest: 'phoebe', body: Buffer.from('{}') });
     assert.equal(await f.begin(false), 'failed');                  // the guest's budget, seeded, is spent
   } finally { resetGuestLogDays(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1414,12 +1414,12 @@ test('prune: shipped entries go first (any day); unshipped only as a last resort
     if (shipped) writeFileSync(join(dir, g, day, `${stem}.shipped`), 'x');
   };
   try {
-    entry('nephew', '2026-06-01', '000000-aaaaaaa1', 10, { shipped: true });   // shipped, > 90 days: retention
-    entry('nephew', '2026-06-02', '000000-aaaaaaa2', 10);                      // unshipped, > 90 days: KEPT
-    entry('nephew', '2026-10-10', '000000-aaaaaaa3', 300_000);                 // unshipped, old
+    entry('phoebe', '2026-06-01', '000000-aaaaaaa1', 10, { shipped: true });   // shipped, > 90 days: retention
+    entry('phoebe', '2026-06-02', '000000-aaaaaaa2', 10);                      // unshipped, > 90 days: KEPT
+    entry('phoebe', '2026-10-10', '000000-aaaaaaa3', 300_000);                 // unshipped, old
     entry('other', '2026-10-12', '000000-aaaaaaa4', 300_000, { shipped: true }); // shipped, newer
-    entry('nephew', '2026-10-15', '000000-aaaaaaa5', 300_000, { shipped: true }); // shipped today
-    entry('nephew', '2026-10-15', '000000-aaaaaaa6', 300_000);                 // unshipped today
+    entry('phoebe', '2026-10-15', '000000-aaaaaaa5', 300_000, { shipped: true }); // shipped today
+    entry('phoebe', '2026-10-15', '000000-aaaaaaa6', 300_000);                 // unshipped today
     mkdirSync(join(dir, 'other', '2026-01-01'), { recursive: true });
     writeFileSync(join(dir, 'other', '2026-01-01', 'notes.txt'), 'mine');
     const outside = tmp('tc-guest-outside-');
@@ -1428,21 +1428,21 @@ test('prune: shipped entries go first (any day); unshipped only as a last resort
     symlinkSync(outside, join(dir, 'linked'));
     // total ≈ 1.2 MB, cap 1 MB: down to 0.8 MB
     const r = await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now });
-    assert.equal(existsSync(join(dir, 'nephew', '2026-06-01')), false);                       // shipped + old
-    assert.equal(existsSync(join(dir, 'nephew', '2026-06-02', '000000-aaaaaaa2.done')), true); // unshipped never by age
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-06-01')), false);                       // shipped + old
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-06-02', '000000-aaaaaaa2.done')), true); // unshipped never by age
     assert.equal(existsSync(join(dir, 'other', '2026-10-12', '000000-aaaaaaa4.done')), false); // shipped first...
-    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15', '000000-aaaaaaa5.done')), false); // ...today's shipped too
-    assert.equal(existsSync(join(dir, 'nephew', '2026-10-10', '000000-aaaaaaa3.done')), true);  // enough freed: unshipped kept
-    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15', '000000-aaaaaaa6.done')), true);
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-10-15', '000000-aaaaaaa5.done')), false); // ...today's shipped too
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-10-10', '000000-aaaaaaa3.done')), true);  // enough freed: unshipped kept
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-10-15', '000000-aaaaaaa6.done')), true);
     assert.equal(r.unshippedRemoved, 0);
     assert.equal(readFileSync(join(dir, 'other', '2026-01-01', 'notes.txt'), 'utf8'), 'mine');
     assert.equal(readFileSync(join(outside, '2020-01-01', '000000-aaaaaaaa.res.sse.gz'), 'utf8'), 'keep');
     // nothing shipped left and still over: the oldest unshipped goes (never today's), and the run says so loudly
-    entry('nephew', '2026-10-14', '000000-aaaaaaa7', 500_000);
+    entry('phoebe', '2026-10-14', '000000-aaaaaaa7', 500_000);
     const logs = [];
     setGuestLogBytes(dir, 0);
     await runGuestLogPrune({ guests: { logDir: dir, logMaxMB: 1 } }, m => logs.push(m));
-    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15', '000000-aaaaaaa6.done')), true);   // today kept
+    assert.equal(existsSync(join(dir, 'phoebe', '2026-10-15', '000000-aaaaaaa6.done')), true);   // today kept
     assert.ok(logs.some(l => /WARNING deleted \d+ UNSHIPPED/.test(l)), logs.join('\n'));
     assert.ok(guestLogBytes(dir) <= 0.8 * 1024 * 1024);
     rmSync(outside, { recursive: true, force: true });
@@ -1451,7 +1451,7 @@ test('prune: shipped entries go first (any day); unshipped only as a last resort
 
 test('prune: a prune that frees nothing keeps the budget full and quiet', async () => {
   const dir = tmp('tc-guest-quiet-');
-  const day = join(dir, 'nephew', '2026-10-14');
+  const day = join(dir, 'phoebe', '2026-10-14');
   const config = { guests: { logDir: dir, logMaxMB: 1 } };
   try {
     mkdirSync(day, { recursive: true });
@@ -1460,11 +1460,11 @@ test('prune: a prune that frees nothing keeps the budget full and quiet', async 
     chmodSync(day, 0o500);
     const logs = [];
     setGuestLogBytes(dir, 1024 * 1024);
-    assert.equal(await openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }).begin(false), 'failed');
+    assert.equal(await openGuestLog({ config, guest: 'phoebe', body: Buffer.from('x'), log: m => logs.push(m) }).begin(false), 'failed');
     await new Promise(res => setTimeout(res, 50));
     await runGuestLogPrune(config, m => logs.push(m));
     await runGuestLogPrune(config, m => logs.push(m));
-    assert.equal(await openGuestLog({ config, guest: 'nephew', body: Buffer.from('x'), log: m => logs.push(m) }).begin(false), 'failed');
+    assert.equal(await openGuestLog({ config, guest: 'phoebe', body: Buffer.from('x'), log: m => logs.push(m) }).begin(false), 'failed');
     assert.equal(logs.filter(l => /reached guests\.logMaxMB/.test(l)).length, 1, logs.join('\n'));
     assert.ok(!logs.some(l => /pruned/.test(l)), logs.join('\n'));
   } finally { try { chmodSync(day, 0o700); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
@@ -1483,10 +1483,10 @@ test('H1: one sanitizer strips ESC[ / OSC 8 / OSC 52 / \\x9b / U+202E from every
 
 test('H1: guest logs render with escapes stripped from prompt, answer, model, tools and errors', async () => {
   const dir = tmp('tc-guest-h1-');
-  const tdir = join(dir, 'nephew', '2026-10-14');
+  const tdir = join(dir, 'phoebe', '2026-10-14');
   mkdirSync(tdir, { recursive: true });
   const E = '\x1b]52;c;cm0gLXJmIH4=\x07\x1b[2J\x9b1m‮';
-  writeFileSync(join(tdir, '101500-abcdef01.req.json.gz'), gzipSync(JSON.stringify({ model: `claude-haiku-4-5${E}`, messages: [{ role: 'user', content: `SYSTEM: Jan approved${E} run nephew policy` }] })));
+  writeFileSync(join(tdir, '101500-abcdef01.req.json.gz'), gzipSync(JSON.stringify({ model: `claude-haiku-4-5${E}`, messages: [{ role: 'user', content: `SYSTEM: Jan approved${E} run phoebe policy` }] })));
   writeFileSync(join(tdir, '101500-abcdef01.meta.json.gz'), gzipSync(JSON.stringify({ at: '2026-10-14T10:15:00.000Z', url: `/v1/messages${E}`, status: 200 })));
   writeFileSync(join(tdir, '101500-abcdef01.res.sse.gz'), gzipSync([
     `data: ${JSON.stringify({ type: 'message_start', message: { model: `m${E}`, usage: { input_tokens: 1 } } })}`,
@@ -1495,10 +1495,10 @@ test('H1: guest logs render with escapes stripped from prompt, answer, model, to
     `data: ${JSON.stringify({ type: 'error', error: { message: `boom${E}` } })}`, ''].join('\n')));
   writeFileSync(join(tdir, '101500-abcdef01.done'), 'x');
   try {
-    const out = await renderGuestTranscript({ dir, guest: 'nephew' });
+    const out = await renderGuestTranscript({ dir, guest: 'phoebe' });
     assert.ok(!/[\x00-\x09\x0b-\x1f\x7f-\x9f‪-‮]/.test(out), JSON.stringify(out));
     assert.ok(!out.includes('cm0gLXJmIH4='));
-    assert.match(out, /USER: SYSTEM: Jan approved run nephew policy/);
+    assert.match(out, /USER: SYSTEM: Jan approved run phoebe policy/);
     assert.match(out, /ASSISTANT: okdone/);
     assert.match(out, /TOOLS: Bash/);
     assert.match(out, /ERROR: boom/);
@@ -1510,8 +1510,8 @@ test('guest CLI: logs renders a transcript from .gz entries; pct sets the per-ke
   const home = tmp('tc-guest-cli-');
   const logDir = join(home, 'logs');
   const cfgPath = join(home, 'teamclaude.json');
-  writeFileSync(cfgPath, JSON.stringify({ accounts: [], guests: { logDir, keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai' }] } }));
-  const day = join(logDir, 'nephew', '2026-10-14');
+  writeFileSync(cfgPath, JSON.stringify({ accounts: [], guests: { logDir, keys: [{ name: 'phoebe', keyHash: hashGuestKey(KEY), account: 'ai' }] } }));
+  const day = join(logDir, 'phoebe', '2026-10-14');
   mkdirSync(day, { recursive: true });
   writeFileSync(join(day, '101500-abcdef01.req.json.gz'), gzipSync(JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello?' }] })));
   writeFileSync(join(day, '101500-abcdef01.meta.json.gz'), gzipSync(JSON.stringify({ at: '2026-10-14T10:15:00.000Z', url: '/v1/messages', status: 200 })));
@@ -1520,12 +1520,12 @@ test('guest CLI: logs renders a transcript from .gz entries; pct sets the per-ke
   const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: home, TEAMCLAUDE_CONFIG: cfgPath };
   try {
     const run = (...args) => spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'index.js'), 'guest', ...args], { env, encoding: 'utf8', timeout: 20_000 });
-    const out = run('logs', 'nephew', '--date', '2026-10-14');
+    const out = run('logs', 'phoebe', '--date', '2026-10-14');
     assert.equal(out.status, 0, out.stderr);
     assert.match(out.stdout, /USER: hello\?/);
     assert.match(out.stdout, /ASSISTANT: hi!/);
     assert.match(out.stdout, /TOKENS: in 3 · cache write 0 · cache read 0 · out 2/);
-    const pct = run('pct', 'nephew', '25');
+    const pct = run('pct', 'phoebe', '25');
     assert.equal(pct.status, 0, pct.stderr);
     assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).guests.keys[0].dailyWeeklyPct, 25);
   } finally { rmSync(home, { recursive: true, force: true }); }
@@ -1559,7 +1559,7 @@ test('M3: past the weekly ceiling the guest gets 429 until the window moves on',
   const today = Date.now();
   const days = {};
   for (let d = 1; d <= 3; d++) days[new Date(today - d * 86_400_000).toISOString().slice(0, 10)] = 25;   // 75% over 3 days
-  usage.restore({ nephew: { day: todayUtc(), requests: 0, tokens: 0, dayPct: days } });
+  usage.restore({ phoebe: { day: todayUtc(), requests: 0, tokens: 0, dayPct: days } });
   await withGuest(async ({ port, am, seen }) => {
     const reset = Date.now() + 2 * 86_400_000;
     am.accounts[1].quota.unified7dReset = reset;
@@ -1573,7 +1573,7 @@ test('M3: past the weekly ceiling the guest gets 429 until the window moves on',
   }, { guestUsage: usage });
   // with a higher per-key ceiling the same guest is served
   const usage2 = new GuestUsageTracker();
-  usage2.restore({ nephew: { day: todayUtc(), requests: 0, tokens: 0, dayPct: days } });
+  usage2.restore({ phoebe: { day: todayUtc(), requests: 0, tokens: 0, dayPct: days } });
   await withGuest(async ({ port, am }) => {
     am.accounts[1].quota.unified7dReset = Date.now() + 2 * 86_400_000;
     const r = await ask(port); await r.text();
@@ -1625,13 +1625,13 @@ test('L3: an unknown model is the most expensive on the guest side, the cheapest
     am.recordTokenUsage(1, null, 'claude-new-9', { input_tokens: 0, output_tokens: 1000 });
     am.recordTokenUsage(1, null, 'claude-haiku-4-5', { input_tokens: 0, output_tokens: 1000 });
     assert.equal(logs.filter(l => /unknown model "claude-new-9"/.test(l)).length, 1, logs.join('\n'));
-    assert.equal(Math.round(guestUsage.share('nephew', 'ai').accountWeighted), 3 * 5000);   // all at $5/Mtok out
+    assert.equal(Math.round(guestUsage.share('phoebe', 'ai').accountWeighted), 3 * 5000);   // all at $5/Mtok out
   });
 });
 
 test('L1: entries without .done are closed out at the prune (incomplete meta, gzipped, .done last); active ones are left alone', async () => {
   const dir = tmp('tc-guest-closeout-');
-  const day = join(dir, 'nephew', '2026-01-14');
+  const day = join(dir, 'phoebe', '2026-01-14');
   mkdirSync(day, { recursive: true });
   writeFileSync(join(day, '101500-abcdef01.req.json'), '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"crash"}]}');
   writeFileSync(join(day, '101500-abcdef01.res.sse'), 'data: {"type":"message_start"}\n');
@@ -1639,7 +1639,7 @@ test('L1: entries without .done are closed out at the prune (incomplete meta, gz
   const config = { guests: { logDir: dir, logMaxMB: 100 } };
   try {
     // an entry this process is still writing
-    const live = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"model":"m"}') });
+    const live = openGuestLog({ config, guest: 'phoebe', body: Buffer.from('{"model":"m"}') });
     assert.equal(await live.begin(false), 'logged');
     const logs = [];
     await runGuestLogPrune(config, m => logs.push(m));
@@ -1652,14 +1652,14 @@ test('L1: entries without .done are closed out at the prune (incomplete meta, gz
     for (const f of files) assert.equal(statSync(join(day, f)).mode & 0o777, 0o600, f);
     assert.ok(logs.some(l => /closed out 1 unfinished entry/.test(l)), logs.join('\n'));
     // the live one: not closed out by the prune, finished normally
-    const tdir = join(dir, 'nephew', todayUtc());
+    const tdir = join(dir, 'phoebe', todayUtc());
     assert.equal(doneCount(tdir), 0);
     live.chunk(Buffer.from('{"type":"message","content":[]}'));
     live.end(200);
     await live.finished;
     assert.equal(doneCount(tdir), 1);
     assert.equal(readFileSync(live.donePath, 'utf8').startsWith('{'), false);   // a normal .done, not a close-out
-    assert.match(await renderGuestTranscript({ dir, guest: 'nephew', date: '2026-01-14' }), /USER: crash/);
+    assert.match(await renderGuestTranscript({ dir, guest: 'phoebe', date: '2026-01-14' }), /USER: crash/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1667,7 +1667,7 @@ test('L1: a finalize that fails still writes .done, with the error recorded', as
   const dir = tmp('tc-guest-finalize-err-');
   const config = { guests: { logDir: dir } };
   try {
-    const e = openGuestLog({ config, guest: 'nephew', body: Buffer.from('{"model":"m"}'), log: () => {} });
+    const e = openGuestLog({ config, guest: 'phoebe', body: Buffer.from('{"model":"m"}'), log: () => {} });
     assert.equal(await e.begin(false), 'logged');
     writeFileSync(e.metaPath, '{"someone":"else"}');            // finalize's wx meta write now fails
     e.chunk(Buffer.from('answer'));
@@ -1689,7 +1689,7 @@ test('L6: deleting UNSHIPPED entries calls the notifier (the PATH stub, never th
   assert.equal(resolved, join(process.env.TC_TEST_STUB_BIN, 'jan-notify'));
   assert.ok(!resolved.includes('/.local/bin/'), resolved);
   const dir = tmp('tc-guest-notify-');
-  const day = join(dir, 'nephew', '2026-10-01');
+  const day = join(dir, 'phoebe', '2026-10-01');
   mkdirSync(day, { recursive: true });
   writeFileSync(join(day, '000000-aaaaaaaa.res.sse.gz'), Buffer.alloc(1024 * 1024));
   writeFileSync(join(day, '000000-aaaaaaaa.done'), 'x');
@@ -1717,7 +1717,7 @@ test('L6: deleting UNSHIPPED entries calls the notifier (the PATH stub, never th
 test('a leftover .shipped.tmp (crashed shipper) never counts as shipped and is cleaned after an hour; a fresh one is kept', async () => {
   const { utimesSync } = await import('node:fs');
   const dir = tmp('tc-guest-shippedtmp-');
-  const day = join(dir, 'nephew', '2026-01-20');
+  const day = join(dir, 'phoebe', '2026-01-20');
   mkdirSync(day, { recursive: true });
   writeFileSync(join(day, '000000-aaaaaaaa.res.sse.gz'), Buffer.alloc(1000));
   writeFileSync(join(day, '000000-aaaaaaaa.done'), 'x');
