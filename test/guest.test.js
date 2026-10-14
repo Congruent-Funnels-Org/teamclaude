@@ -9,6 +9,7 @@ import {
   hashGuestKey, newGuestKey, resolveGuestKey, presentedGuestKey,
   isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight, checkGuestBody,
   guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
+  findRemoteSource, stripLongContextBetas, zeroCacheFigures,
 } from '../src/guest.js';
 
 function listen(server) {
@@ -135,14 +136,14 @@ test('guestStatus shows counters and never a key or hash', () => {
 
 // The mock upstream answers per account (by the bearer it receives), so a test
 // can make the PINNED account fail and prove the other one is never asked.
-async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accounts = ['jan', 'ai'], hooks = {}, guestUsage: usage = null, configExtra = {} } = {}) {
+async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accounts = ['jan', 'ai'], hooks = {}, guestUsage: usage = null, configExtra = {}, persist = null } = {}) {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     let body = '';
     req.on('data', c => { body += c; });
     req.on('end', () => {
       const who = String(req.headers.authorization || '').replace('Bearer t-', '');
-      seen.push({ who, path: req.url, method: req.method, apiKey: req.headers['x-api-key'], cookie: req.headers.cookie, body });
+      seen.push({ who, path: req.url, method: req.method, apiKey: req.headers['x-api-key'], cookie: req.headers.cookie, beta: req.headers['anthropic-beta'], body });
       const h = upstreamFor[who];
       if (h) return h(req, res, body);
       res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'sess=secret', 'x-ok': '1' });
@@ -155,7 +156,7 @@ async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accou
   const config = { proxy: { apiKey: 'main-key' }, upstream: `http://127.0.0.1:${upstreamPort}`, guests, ...configExtra };
   const guestUsage = usage || new GuestUsageTracker();
   const logs = [];
-  const guest = createGuestServer({ accountManager: am, config, guestUsage, hooks, log: m => logs.push(m) });
+  const guest = createGuestServer({ accountManager: am, config, guestUsage, hooks, persist, log: m => logs.push(m) });
   const port = await listen(guest);
   try {
     return await run({ port, seen, am, guestUsage, config, logs, guest });
@@ -678,4 +679,108 @@ test('bad-key refusals are logged once per remote per minute', async () => {
     assert.equal(lines.length, 1);
     assert.ok(!lines[0].includes('\u001b'));
   });
+});
+
+// ── bounce 3: tiny body, huge input; pre-body cap; cache side channel ──────
+
+test('content by reference, thread and container are refused (bytes/3 would under-reserve)', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const mk = (extra) => JSON.stringify({ model: 'm', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }], ...extra });
+    const msg = (content) => ({ messages: [{ role: 'user', content }] });
+    for (const extra of [
+      msg([{ type: 'image', source: { type: 'url', url: 'https://x/a.png' } }]),
+      msg([{ type: 'document', source: { type: 'url', url: 'https://x/a.pdf' } }]),
+      msg([{ type: 'document', source: { type: 'file', file_id: 'file_1' } }]),
+      msg([{ type: 'image', file_id: 'file_2' }]),
+      msg([{ type: 'tool_result', tool_use_id: 't', content: [{ type: 'document', source: { type: 'url', url: 'https://x' } }] }]),
+      msg([{ type: 'container_upload', file_id: 'f' }]),
+      { system: [{ type: 'text', text: 's' }, { type: 'document', source: { type: 'url', url: 'https://x' } }] },
+      { thread: { type: 'continue', id: 'th_1' } },
+      { container: 'cntr_1' },
+    ]) {
+      const r = await ask(port, { body: mk(extra) });
+      assert.equal(r.status, 400, JSON.stringify(extra));
+      await r.text();
+    }
+    assert.equal(seen.length, 0);
+    const fine = await ask(port, { body: mk(msg([
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+      { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'hello' } },
+      { type: 'tool_use', id: 't', name: 'Fetch', input: { source: { type: 'url', url: 'https://x' }, file_id: 'not-a-ref' } },
+    ])) });
+    await fine.text();
+    assert.equal(fine.status, 200);
+  });
+});
+
+test('findRemoteSource / stripLongContextBetas units', () => {
+  assert.equal(findRemoteSource([{ type: 'text', text: 'x' }]), null);
+  assert.match(findRemoteSource([{ content: [{ content: [{ source: { type: 'url' } }] }] }]), /url/);
+  assert.equal(stripLongContextBetas('context-1m-2025-08-07'), undefined);
+  assert.equal(stripLongContextBetas('oauth-2025-04-20, context-1m-2025-08-07,fine-grained-tool-streaming-2025-05-14'), 'oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14');
+  assert.equal(stripLongContextBetas(undefined), undefined);
+});
+
+test('a long-context beta is stripped before forwarding; other betas pass', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const r = await ask(port, { headers: { 'anthropic-beta': 'context-1m-2025-08-07,interleaved-thinking-2025-05-14' } });
+    await r.text();
+    assert.equal(r.status, 200);
+    assert.ok(!String(seen[0].beta || '').includes('context-1m'), String(seen[0].beta));
+    assert.ok(String(seen[0].beta || '').includes('interleaved-thinking-2025-05-14'));
+  });
+});
+
+test('a capped-out key gets its 429 before the body is read', async () => {
+  const usage = new GuestUsageTracker();
+  usage.recordTokens('nephew', 500);
+  await withGuest(async ({ port, seen }) => {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/messages',
+        headers: { 'x-api-key': KEY, 'content-type': 'application/json', 'content-length': String(7 * 1024 * 1024) } }, res => { res.resume(); resolve(res.statusCode); });
+      req.on('error', reject);
+      req.write('{"max_tokens":');   // a body that will never finish
+    });
+    assert.equal(status, 429);
+    assert.equal(seen.length, 0);
+  }, { guestUsage: usage, guests: guestsConfig({ dailyTokenCap: 500 }) });
+  assert.equal(GUEST_DEFAULTS.maxBodyBytes, 8 * 1024 * 1024);
+});
+
+test('prompt-cache figures reach the guest as 0 but are booked in full', async () => {
+  const sse = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-should-retry': 'false' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7,"cache_read_input_tokens":40,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":0}');
+    res.write(',"output_tokens":1}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"cache_read_input_tokens": 40}}\n\n');
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  };
+  await withGuest(async ({ port, guestUsage }) => {
+    const res = await ask(port);
+    const text = await res.text();
+    assert.equal(res.headers.get('x-should-retry'), 'false');
+    assert.ok(!/"cache_read_input_tokens":\s*40/.test(text), text);
+    assert.match(text, /"cache_read_input_tokens":0/);
+    assert.match(text, /"ephemeral_5m_input_tokens":0/);
+    assert.match(text, /"input_tokens":7/);
+    assert.equal(guestUsage.tokensToday('nephew'), 59);
+  }, { upstreamFor: { ai: sse } });
+  const json = (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":1000}}'); };
+  await withGuest(async ({ port, guestUsage }) => {
+    const res = await ask(port);
+    const body = await res.json();
+    assert.equal(body.usage.cache_read_input_tokens, 0);
+    assert.equal(guestUsage.tokensToday('nephew'), 1005);
+  }, { upstreamFor: { ai: json } });
+  assert.equal(zeroCacheFigures('{"cache_read_input_tokens" : 12}'), '{"cache_read_input_tokens" : 0}');
+});
+
+test('usage crossing 90% of the cap is persisted at once', async () => {
+  let saves = 0;
+  await withGuest(async ({ port }) => {
+    const r = await ask(port);   // books 135 of a 140 cap
+    await r.text();
+    assert.equal(r.status, 200);
+    assert.equal(saves, 1);
+  }, { persist: async () => { saves += 1; }, guests: guestsConfig({ dailyTokenCap: 140 }) });
 });
