@@ -99,9 +99,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     const state = g.listening?.listening ? 'listening' : g.listen ? `not listening${g.listening?.error ? ' (' + g.listening.error + ')' : ''}` : 'off';
     lines.push(`${paint.bold('Guests')} ${paint.dim(`${where}, ${state}`)}`);
     for (const k of guestKeys) {
-      const cap = k.dailyTokenCap === 'unlimited' ? '/unlimited' : k.dailyTokenCap ? `/${Number(k.dailyTokenCap).toLocaleString('en-US')}` : ' (no cap: refused)';
+      const cap = k.dailyTokenCap === 'unlimited' ? '/unlimited' : k.dailyTokenCap ? `/${Number(k.dailyTokenCap).toLocaleString('en-US')}` : '';
       const seen = k.lastSeen ? `last seen ${k.lastSeen}` : 'never seen';
-      lines.push(`  ${safeLine(String(k.name))}  ${k.enabled ? 'enabled' : paint.dim('disabled')}  → ${safeLine(String(k.account || "?"))}  ${Number(k.tokensToday || 0).toLocaleString('en-US')}${cap} tokens today, ${k.requestsToday || 0} req  ${paint.dim(seen)}`);
+      const share = k.capPct == null ? '' : `  ${k.sharePct == null ? 'n/a' : Number(k.sharePct).toFixed(1) + '%'} of weekly today / cap ${k.capPct}%${k.locked ? ' ' + paint.bold('LOCKED') : ''}`
+        + (k.weeklyCapPct == null ? '' : `, ${Number(k.weekSharePct || 0).toFixed(1)}% this week / cap ${k.weeklyCapPct}%${k.weeklyLocked ? ' ' + paint.bold('WEEK LIMIT') : ''}`)
+        + (k.paused ? ' ' + paint.bold('PAUSED (5h)') : '');
+      lines.push(`  ${safeLine(String(k.name))}  ${k.enabled ? 'enabled' : paint.dim('disabled')}  → ${safeLine(String(k.account || "?"))}${share}  ${Number(k.tokensToday || 0).toLocaleString('en-US')}${cap} tokens today, ${k.requestsToday || 0} req  ${paint.dim(seen)}`);
     }
     lines.push('');
   }

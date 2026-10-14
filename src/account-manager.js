@@ -95,7 +95,7 @@ export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
-  'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
+  'unified7dSonnetSeenAt', 'unified7dFableSeenAt', 'unified7dSeenAt',
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
@@ -154,6 +154,9 @@ function emptyQuota() {
     // itself into, since selection stops sending the family that would refresh them.
     unified7dSonnetSeenAt: null,
     unified7dFableSeenAt: null,
+    // When the shared weekly reading was last confirmed by upstream (ms). Read
+    // by the guest cap (guest.js), which must not act on a stale figure.
+    unified7dSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     // Normalized reading from a third-party backend (see backend-quota.js).
     // { label, text, utilization, at } — nothing here knows which provider.
@@ -3392,6 +3395,7 @@ export class AccountManager {
     if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
     if (parsed.unified7d != null) {
       account.quota.unified7d = parsed.unified7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
@@ -3462,6 +3466,7 @@ export class AccountManager {
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) {
       account.quota.unified7d = u7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
 
@@ -3625,6 +3630,21 @@ export class AccountManager {
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
     this.sessionTracker.recordTokens(sessionId, bucket, usage);
+    // Observers (the guest cap's per-account day totals). One that throws must
+    // never cost the response its accounting.
+    for (const fn of this._tokenUsageListeners || []) {
+      try { fn(accountIndex, usage, model); } catch { /* observer bug, not ours */ }
+    }
+  }
+
+  /**
+   * Be told about every message's final usage on every account (the same
+   * figures recordTokenUsage books). Returns an unsubscribe function.
+   * @param {(accountIndex: number, usage: any, model?: any) => void} fn
+   */
+  onTokenUsage(fn) {
+    (this._tokenUsageListeners ??= new Set()).add(fn);
+    return () => { this._tokenUsageListeners?.delete(fn); };
   }
 
   /**
@@ -3667,6 +3687,7 @@ export class AccountManager {
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) {
         q.unified7d = usage.sevenDay.utilization;
+        q.unified7dSeenAt = Date.now();
         observed.add('unified7d');
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
