@@ -7,7 +7,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   createGuestServer, startGuestListener, GuestUsageTracker, guestStatus,
   hashGuestKey, newGuestKey, resolveGuestKey, presentedGuestKey,
-  isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight,
+  isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight, checkGuestBody,
   guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
 } from '../src/guest.js';
 
@@ -167,10 +167,10 @@ async function withGuest(run, { upstreamFor = {}, guests = guestsConfig(), accou
   }
 }
 
-const ask = (port, { key = KEY, path = '/v1/messages?beta=true', method = 'POST', headers = {} } = {}) => fetch(`http://127.0.0.1:${port}${path}`, {
+const ask = (port, { key = KEY, path = '/v1/messages?beta=true', method = 'POST', headers = {}, body = null } = {}) => fetch(`http://127.0.0.1:${port}${path}`, {
   method,
   headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}), ...headers },
-  body: method === 'GET' ? undefined : JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+  body: method === 'GET' ? undefined : (body ?? JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] })),
 });
 
 test('a guest request is served by its pinned account with the account token, guest key stripped', async () => {
@@ -544,7 +544,8 @@ test('only allow-listed response headers reach the guest', async () => {
     assert.equal(res.headers.get('x-envoy-upstream-service-time'), null);
     assert.equal(res.headers.get('set-cookie'), null);
     assert.equal(res.headers.get('request-id'), 'req_1');
-    assert.equal(res.headers.get('anthropic-ratelimit-unified-status'), 'allowed');
+    // the pinned account's quota state is not the guest's business
+    assert.equal(res.headers.get('anthropic-ratelimit-unified-status'), null);
   }, { upstreamFor: { ai: leaky } });
 });
 
@@ -580,4 +581,101 @@ test('guest prompts are not written to the request log unless guests.logBodies',
       assert.deepEqual(readdirSync(dir), []);
     }, { configExtra: { logDir: dir } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── bounce 2: no way around the cap ─────────────────────────────────────────
+
+test('an answer cut short before message_delta is booked at its worst case', async () => {
+  const hang = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}\n\n');
+    const t = setInterval(() => res.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"' + 'x'.repeat(2000) + '"}}\n\n'), 10);
+    res.on('close', () => clearInterval(t));
+  };
+  await withGuest(async ({ port, guestUsage }) => {
+    const ac = new AbortController();
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', signal: ac.signal,
+      headers: { 'x-api-key': KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', max_tokens: 1000, stream: true, messages: [] }) });
+    const reader = res.body.getReader();
+    let got = 0;
+    while (got < 10_000) { const { value } = await reader.read(); got += value.length; }
+    ac.abort();
+    await new Promise(r => setTimeout(r, 150));
+    // 7 input from message_start + the full 1000 output it was allowed
+    assert.ok(guestUsage.tokensToday('nephew') >= 1007, String(guestUsage.tokensToday('nephew')));
+  }, { upstreamFor: { ai: hang } });
+});
+
+test('input a server-side round adds after message_start is booked from message_delta', async () => {
+  const grow = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":90000,"cache_read_input_tokens":0,"output_tokens":5}}\n\n');
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  };
+  await withGuest(async ({ port, guestUsage }) => {
+    const res = await ask(port);
+    await res.text();
+    assert.equal(guestUsage.tokensToday('nephew'), 90005);
+  }, { upstreamFor: { ai: grow } });
+});
+
+test('server-side tools and MCP servers are refused; custom tools pass', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const mk = (extra) => JSON.stringify({ model: 'm', max_tokens: 16, messages: [], ...extra });
+    for (const extra of [
+      { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+      { tools: [{ name: 'Read', input_schema: {} }, { type: 'web_fetch_20250910', name: 'web_fetch' }] },
+      { tools: [{ type: 'code_execution_20250825', name: 'code_execution' }] },
+      { tools: [{ type: 'advisor_20260301', name: 'advisor' }] },
+      { tools: 'web_search' },
+      { mcp_servers: [{ type: 'url', url: 'https://x', name: 'x' }] },
+    ]) {
+      const r = await ask(port, { body: mk(extra) });
+      assert.equal(r.status, 400, JSON.stringify(extra));
+      await r.text();
+    }
+    assert.equal(seen.length, 0);
+    const ok = await ask(port, { body: mk({ tools: [{ name: 'Read', input_schema: { type: 'object' } }, { type: 'custom', name: 'Bash', input_schema: {} }] }) });
+    await ok.text();
+    assert.equal(ok.status, 200);
+  });
+});
+
+test('compressed bodies are 415; bad JSON or max_tokens are 400; nothing is forwarded', async () => {
+  await withGuest(async ({ port, seen }) => {
+    const { gzipSync } = await import('node:zlib');
+    const gz = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST',
+      headers: { 'x-api-key': KEY, 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: gzipSync(JSON.stringify({ model: 'm', max_tokens: 16, messages: [] })) });
+    assert.equal(gz.status, 415);
+    await gz.text();
+    for (const body of ['not json', '[]', '{"model":"m","messages":[]}', '{"max_tokens":0}', '{"max_tokens":-1}',
+      '{"max_tokens":1000000000}', '{"max_tokens":"16"}', '{"max_tokens":16.5}']) {
+      const r = await ask(port, { body });
+      assert.equal(r.status, 400, body);
+      await r.text();
+    }
+    const ct = await ask(port, { path: '/v1/messages/count_tokens', body: 'nope' });
+    assert.equal(ct.status, 400);
+    await ct.text();
+    assert.equal(seen.length, 0);
+  });
+});
+
+test('checkGuestBody: count_tokens needs no max_tokens; models needs no body', () => {
+  assert.ok(checkGuestBody('/v1/messages/count_tokens', {}, Buffer.from('{"messages":[]}')).ok);
+  assert.ok(checkGuestBody('/v1/models', {}, Buffer.alloc(0)).ok);
+  assert.equal(checkGuestBody('/v1/messages', { 'content-encoding': 'identity' }, Buffer.from('{"max_tokens":5}')).ok, true);
+  assert.equal(checkGuestBody('/v1/messages', { 'content-encoding': 'br' }, Buffer.from('{"max_tokens":5}')).status, 415);
+});
+
+test('bad-key refusals are logged once per remote per minute', async () => {
+  await withGuest(async ({ port, logs }) => {
+    for (let i = 0; i < 6; i++) { const r = await ask(port, { key: 'nope', path: '/v1/messages?\u001b[31m' }); await r.text(); }
+    const lines = logs.filter(l => /bad key/.test(l));
+    assert.equal(lines.length, 1);
+    assert.ok(!lines[0].includes('\u001b'));
+  });
 });

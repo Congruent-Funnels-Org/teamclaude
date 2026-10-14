@@ -40,6 +40,7 @@ import net from 'node:net';
 import { Readable } from 'node:stream';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createProxyRequestListener, resolveAccountPin } from './server.js';
+import { safeLine } from './safe-text.js';
 
 export const GUEST_KEY_PREFIX = 'tcg-';
 export const GUEST_RETRY_BIND_MS = 10_000;
@@ -71,7 +72,8 @@ const ALLOWED_RESPONSE_HEADERS = new Set(['content-type', 'content-length', 'con
   'date', 'request-id', 'x-request-id', 'retry-after']);
 const isAllowedResponseHeader = (/** @type {string} */ name) => {
   const n = String(name).toLowerCase();
-  return ALLOWED_RESPONSE_HEADERS.has(n) || n.startsWith('anthropic-ratelimit-');
+  // Not anthropic-ratelimit-*: those publish the pinned account's quota state.
+  return ALLOWED_RESPONSE_HEADERS.has(n);
 };
 const GENERIC_ERROR = (/** @type {number} */ status) => `The relay could not serve this request (${status}). Try again in a bit; if it keeps happening, tell the person who gave you this key.`;
 
@@ -158,18 +160,53 @@ function keyLimit(key, field) {
   return Number.isInteger(n) && n > 0 ? n : GUEST_DEFAULTS[field];
 }
 
+export const MAX_GUEST_MAX_TOKENS = 128_000;
+
+/** A tool the CLIENT runs (name + input_schema, no type or type "custom"). @param {any} t */
+function isCustomTool(t) {
+  return t && typeof t === 'object' && (t.type == null || t.type === 'custom');
+}
+
 /**
- * Reserve-before-send estimate: what this request could add to today's total
- * before its real usage is known. Prompt bytes/3 (a generous tokens-per-byte
- * ratio) plus the output it asked for.
+ * Check a guest body before anything is reserved or sent, and work out its
+ * worst case. Every way to make the estimate small without making the request
+ * small is refused: a compressed body (the estimate would see the compressed
+ * bytes), unparseable JSON, a missing / non-positive / absurd max_tokens, and
+ * server-side tools or MCP servers (their input and cost never show up in the
+ * figures the cap reads up front, and they spend the account's quota).
+ * @param {string} pathname @param {Record<string, any>} headers @param {Buffer} body
+ * @returns {{ ok: true, estimate: number, inputEstimate: number, maxTokens: number } | { ok: false, status: number, type: string, message: string }}
+ */
+export function checkGuestBody(pathname, headers, body) {
+  const enc = String(headers?.['content-encoding'] ?? '').trim().toLowerCase();
+  if (enc && enc !== 'identity') return { ok: false, status: 415, type: 'invalid_request_error', message: 'Compressed request bodies are not accepted here.' };
+  if (pathname === '/v1/models' || pathname.startsWith('/v1/models/')) return { ok: true, estimate: 0, inputEstimate: 0, maxTokens: 0 };
+  let json;
+  try { json = JSON.parse(body.toString('utf8')); } catch { json = undefined; }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return { ok: false, status: 400, type: 'invalid_request_error', message: 'The request body must be a JSON object.' };
+  if (Array.isArray(json.tools) && !json.tools.every(isCustomTool)) {
+    return { ok: false, status: 400, type: 'invalid_request_error', message: 'Server-side tools (web search, web fetch, code execution, advisor) are not available through this relay.' };
+  }
+  if (json.tools != null && !Array.isArray(json.tools)) return { ok: false, status: 400, type: 'invalid_request_error', message: 'tools must be a list.' };
+  if (json.mcp_servers != null && !(Array.isArray(json.mcp_servers) && json.mcp_servers.length === 0)) {
+    return { ok: false, status: 400, type: 'invalid_request_error', message: 'MCP servers are not available through this relay.' };
+  }
+  const inputEstimate = Math.ceil(body.length / 3);
+  if (pathname === '/v1/messages/count_tokens') return { ok: true, estimate: inputEstimate, inputEstimate, maxTokens: 0 };
+  const m = json.max_tokens;
+  if (!Number.isInteger(m) || m <= 0 || m > MAX_GUEST_MAX_TOKENS) {
+    return { ok: false, status: 400, type: 'invalid_request_error', message: `max_tokens must be a whole number from 1 to ${MAX_GUEST_MAX_TOKENS}.` };
+  }
+  return { ok: true, estimate: inputEstimate + m, inputEstimate, maxTokens: m };
+}
+
+/**
+ * Reserve-before-send estimate: prompt bytes/3 + max_tokens (see checkGuestBody).
  * @param {Buffer} body
  */
 export function estimateRequestTokens(body) {
-  let maxTokens = 0;
-  if (body.length) {
-    try { maxTokens = Number(JSON.parse(body.toString('utf8'))?.max_tokens) || 0; } catch { /* not JSON */ }
-  }
-  return Math.ceil(body.length / 3) + Math.max(0, Math.min(maxTokens, 1_000_000));
+  const r = checkGuestBody('/v1/messages', {}, body);
+  return r.ok ? r.estimate : Math.ceil(body.length / 3);
 }
 
 /** The configured keys that can authenticate: named, hashed, enabled. */
@@ -445,6 +482,8 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
   const listeners = new Map(); // "name\0pin" → forwarding listener
   /** @type {Map<string, {inflight: number, reserved: number, recent: number[]}>} */
   const live = new Map();
+  /** @type {Map<string, {at: number, n: number}>} */
+  const refusedLog = new Map();
   const liveOf = (/** @type {string} */ name) => {
     let l = live.get(name);
     if (!l) { l = { inflight: 0, reserved: 0, recent: [] }; live.set(name, l); }
@@ -494,7 +533,14 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
     }
     const key = resolveGuestKey(config.guests, presentedGuestKey(req.headers));
     if (!key) {
-      log(`[TeamClaude] guest: refused ${req.method} ${req.url} from ${remote} (bad key)`);
+      // One line per remote per minute, however hard it knocks.
+      const t = Date.now();
+      const last = refusedLog.get(remote);
+      if (!last || t - last.at >= 60_000) {
+        log(`[TeamClaude] guest: refused ${safeLine(req.method)} ${safeLine(req.url)} from ${safeLine(remote)} (bad key)${last?.n ? `, +${last.n} more in the last minute` : ''}`);
+        refusedLog.set(remote, { at: t, n: 0 });
+        if (refusedLog.size > 1000) refusedLog.clear();
+      } else last.n += 1;
       sendJson(res, 401, 'authentication_error', 'Invalid guest key.');
       return;
     }
@@ -527,11 +573,25 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
     state.inflight += 1;
     let reservation = 0;
     let released = false;
+    // What this request has booked so far, to settle a cut-short answer.
+    const booked = { input: 0, output: 0, final: false, forwarded: false, maxTokens: 0, inputEstimate: 0, completion: false };
     const release = () => {
       if (released) return;
       released = true;
       state.inflight -= 1;
       state.reserved -= reservation;
+      // A completion whose final usage never arrived (the guest hung up before
+      // message_delta, the stream broke) is charged its worst case: whatever it
+      // was allowed to produce and has not been booked, plus the prompt
+      // estimate when even message_start never came. Conservative on purpose:
+      // a guest who aborts while the request is still queued pays for it too.
+      if (booked.forwarded && booked.completion && !booked.final && (res.statusCode || 200) < 400) {
+        const shortfall = Math.max(0, booked.maxTokens - booked.output) + (booked.input > 0 ? 0 : booked.inputEstimate);
+        if (shortfall > 0) {
+          guestUsage.recordTokens(name, shortfall);
+          log(`[TeamClaude] guest ${name}: answer cut short, booked ${shortfall} tokens (worst case)`);
+        }
+      }
     };
     res.once('close', release);
     try {
@@ -542,10 +602,21 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
         req.destroy?.();
         return;
       }
+      const pathname = new URL(req.url, 'http://guest.invalid').pathname;
+      const checked = checkGuestBody(pathname, req.headers, body);
+      if (!checked.ok) {
+        const bad = /** @type {{status: number, type: string, message: string}} */ (/** @type {unknown} */ (checked));
+        sendJson(res, bad.status, bad.type, bad.message);
+        return;
+      }
+      const good = /** @type {{estimate: number, inputEstimate: number, maxTokens: number}} */ (/** @type {unknown} */ (checked));
+      booked.maxTokens = good.maxTokens;
+      booked.inputEstimate = good.inputEstimate;
+      booked.completion = pathname === '/v1/messages';
       // Reserve before sending: today's real usage + what is in flight + this
       // request's worst case must fit, so parallel requests cannot all slip in
       // under the cap and land far past it.
-      reservation = Number.isFinite(cap) ? estimateRequestTokens(body) : 0;
+      reservation = Number.isFinite(cap) ? good.estimate : 0;
       if (Number.isFinite(cap) && guestUsage.tokensToday(name) + state.reserved + reservation > cap) {
         log(`[TeamClaude] guest ${name}: daily cap ${cap} reached (used ${guestUsage.tokensToday(name)}, in flight ${state.reserved}), 429`);
         reservation = 0;
@@ -570,7 +641,24 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       replay.tcGuest = name;
       // Tokens are booked to the guest through the same usage hook every
       // response path already feeds (stream and buffered alike).
-      replay.tcGuestUsage = (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache) => guestUsage.recordTokens(name, (input || 0) + (output || 0) + (cache || 0));
+      // message_start books input + cache; message_delta books output and may
+      // carry a larger CUMULATIVE input (server-side tool rounds): the larger
+      // figure wins, so input added after the start is booked too.
+      replay.tcGuestUsage = (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache, /** @type {any} */ cumulative) => {
+        const fresh = (input || 0) + (cache || 0);
+        let add = fresh + (output || 0);
+        booked.input += fresh;
+        booked.output += output || 0;
+        // The figures that close a completion: message_delta (cumulative) or a
+        // whole buffered body (input and output in one call).
+        if (cumulative || (output || 0) > 0) booked.final = true;
+        if (cumulative && typeof cumulative === 'object') {
+          const total = (Number(cumulative.input_tokens) || 0) + (Number(cumulative.cache_creation_input_tokens) || 0) + (Number(cumulative.cache_read_input_tokens) || 0);
+          if (total > booked.input) { add += total - booked.input; booked.input = total; }
+        }
+        guestUsage.recordTokens(name, add);
+      };
+      booked.forwarded = true;
       await forwarderFor(key)(replay, res);
     } finally {
       if (res.writableEnded || res.destroyed) release();
