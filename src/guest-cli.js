@@ -72,17 +72,33 @@ async function deliverKey(key, keyFile, what) {
   }
 }
 
-/** @param {any} config */
+/**
+ * Tell the running server to reload. A server that is not running is fine (the
+ * change applies when it starts); one that IS running and refuses or fails the
+ * reload is an error: the command exits non-zero so a caller (`nephew off`)
+ * never believes a key is off while the server still honours it.
+ * @param {any} config
+ * @returns {Promise<'reloaded'|'no-server'|'failed'>}
+ */
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
-  if (!port) return;
+  if (!port) return 'no-server';
+  let res;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/reload`, {
+    res = await fetch(`http://127.0.0.1:${port}/teamclaude/reload`, {
       method: 'POST',
       headers: { 'x-api-key': config.proxy?.apiKey || '' },
+      signal: AbortSignal.timeout(5000),
     });
-    if (res.ok) console.log('Reloaded running server.');
-  } catch { /* no server running */ }
+  } catch (err) {
+    const code = /** @type {any} */ (err)?.cause?.code;
+    if (code === 'ECONNREFUSED') { console.log('No server running: the change applies when it starts.'); return 'no-server'; }
+    fail(`The running server could not be reached to reload (${code || (err instanceof Error ? err.message : String(err))}). The config is saved but NOT live yet: run 'teamclaude service restart' or retry.`);
+    return 'failed';
+  }
+  if (res.ok) { console.log('Reloaded running server.'); return 'reloaded'; }
+  fail(`The running server refused the reload (HTTP ${res.status}). The config is saved but NOT live yet.`);
+  return 'failed';
 }
 
 /** @param {any} config @returns {Promise<any>} */

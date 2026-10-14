@@ -864,3 +864,45 @@ test('a PDF of unknown length is refused at a cap it cannot fit', async () => {
     assert.equal(seen.length, 0);
   }, { guests: guestsConfig({ dailyTokenCap: 50000 }) });
 });
+
+// ── `teamclaude guest` must not fail open when the live reload fails ────────
+
+test('guest CLI: a running server that fails the reload makes the command exit non-zero', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-cli-'));
+  const run = (port, ...args) => {
+    const cfg = join(dir, 'tc.json');
+    writeFileSync(cfg, JSON.stringify({ proxy: { port, apiKey: 'k' }, accounts: [{ name: 'ai', type: 'oauth' }],
+      guests: { keys: [{ name: 'n', keyHash: hashGuestKey('x'), account: 'ai', dailyTokenCap: 5, enabled: true }] } }));
+    return spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'index.js'), 'guest', ...args],
+      { env: { ...process.env, TEAMCLAUDE_CONFIG: cfg }, encoding: 'utf8', timeout: 20_000 });
+  };
+  // A port nothing listens on (bound, then closed).
+  const srv = http.createServer();
+  const port = await listen(srv);
+  await new Promise(r => srv.close(r));
+  // spawnSync blocks this event loop, so the stub reload endpoint runs in a child process.
+  const { spawn } = await import('node:child_process');
+  const child = (status) => new Promise((resolve) => {
+    const c = spawn(process.execPath, ['-e', `require('http').createServer((q,r)=>{q.resume();r.writeHead(${status});r.end('{}')}).listen(0,'127.0.0.1',function(){console.log(this.address().port)})`]);
+    c.stdout.once('data', d => resolve({ c, port: Number(String(d).trim()) }));
+  });
+  try {
+    const bad = await child(500);
+    const r1 = run(bad.port, 'disable', 'n', '--rotate');
+    bad.c.kill();
+    assert.equal(r1.status, 1, r1.stdout + r1.stderr);
+    assert.match(r1.stderr, /refused the reload \(HTTP 500\).*NOT live/);
+    const good = await child(200);
+    const r2 = run(good.port, 'disable', 'n');
+    good.c.kill();
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    assert.match(r2.stdout, /Reloaded running server/);
+    const r3 = run(port, 'enable', 'n');   // nothing listens there now
+    assert.equal(r3.status, 0, r3.stdout + r3.stderr);
+    assert.match(r3.stdout, /No server running/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
