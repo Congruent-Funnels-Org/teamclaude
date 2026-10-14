@@ -10,19 +10,24 @@
 
 import { open } from 'node:fs/promises';
 import { atomicConfigUpdate, loadConfig } from './config.js';
-import { hashGuestKey, newGuestKey, guestHostProblem } from './guest.js';
+import { hashGuestKey, newGuestKey, guestHostProblem, guestCap, guestPct, GUEST_DEFAULTS } from './guest.js';
+import { guestLogDir, renderGuestTranscript } from './guest-log.js';
 
 export const GUEST_USAGE = `Usage:
   teamclaude guest list [--json]
-  teamclaude guest add <name> --account <account> --cap <tokens/day|unlimited> [--key-file <path>]
+  teamclaude guest add <name> --account <account> [--pct <percent>] [--cap <tokens/day|unlimited>] [--key-file <path>]
   teamclaude guest rotate <name> [--key-file <path>]
   teamclaude guest enable <name> | disable <name> [--rotate]
+  teamclaude guest pct <name> <percent|default>
   teamclaude guest cap <name> <tokens/day|unlimited>
+  teamclaude guest logs <name> [--date YYYY-MM-DD]
   teamclaude guest remove <name>
   teamclaude guest listen <host> <port> | listen off
 Guest keys reach ONE pinned account on a separate listener (config.guests).
-The daily cap is per UTC day, counting input + output + cache tokens. It is required:
-a key without one is refused by the listener.`;
+The daily limit is usage-based: a guest locks until 00:00 UTC once its share of the
+pinned account's WEEKLY quota used today reaches its % (pct; default ${GUEST_DEFAULTS.dailyWeeklyPct},
+guests.dailyWeeklyPct). cap is only a runaway backstop in raw tokens (default 100M).
+logs prints a guest's saved requests and answers for one day (default: the latest).`;
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -50,9 +55,16 @@ function fail(msg) {
   process.exitCode = 1;
 }
 
+/** @param {unknown} v @returns {number} */
+function parsePct(v) {
+  const n = Number(String(v).replace(/%$/, ''));
+  if (!Number.isFinite(n) || n <= 0 || n > 100) throw new Error(`Bad percent "${v}": a number above 0 and at most 100 (30 = 30% of the weekly quota per day).`);
+  return n;
+}
+
 /** @param {unknown} v @returns {number|'unlimited'} */
 function parseCap(v) {
-  if (v === undefined || v === true) throw new Error('A daily cap is required: --cap <tokens/day> (e.g. 3000000) or --cap unlimited.');
+  if (v === undefined || v === true) throw new Error('A cap needs a value: <tokens/day> (e.g. 100000000) or unlimited.');
   if (String(v) === 'unlimited') return 'unlimited';
   const n = Number(String(v).replace(/[_,]/g, ''));
   if (!Number.isInteger(n) || n <= 0) throw new Error(`Bad cap "${v}": a whole number of tokens per day above 0, or "unlimited".`);
@@ -147,9 +159,12 @@ export async function guestCommand(argv) {
         const live = await fetchLiveGuests(config);
         const rows = (config.guests?.keys || []).map((/** @type {any} */ k) => {
           const u = live?.keys?.find((/** @type {any} */ l) => l.name === k.name) || {};
+          const cap = guestCap(k);
           return {
             name: k.name, account: k.account, enabled: k.enabled !== false,
-            dailyTokenCap: k.dailyTokenCap ?? null,
+            dailyTokenCap: cap === Infinity ? 'unlimited' : cap,
+            capPct: guestPct(k, config.guests),
+            sharePct: u.sharePct ?? null, shareStale: u.shareStale ?? null, locked: u.locked ?? null,
             tokensToday: u.tokensToday ?? null, requestsToday: u.requestsToday ?? null, lastSeen: u.lastSeen ?? null,
           };
         });
@@ -163,9 +178,13 @@ export async function guestCommand(argv) {
         console.log(`Guest listener: ${listen ? `${listen.host}:${listen.port}` : 'off'}${listen ? state : ''}`);
         if (!rows.length) { console.log('No guest keys.'); return; }
         for (const r of rows) {
-          const cap = r.dailyTokenCap === 'unlimited' ? 'unlimited' : r.dailyTokenCap ? Number(r.dailyTokenCap).toLocaleString('en-US') : 'NO CAP (refused)';
-          const today = r.tokensToday == null ? 'server not reachable' : `${r.tokensToday.toLocaleString('en-US')} tokens / ${r.requestsToday} req today`;
-          console.log(`  ${r.name}  ${r.enabled ? 'enabled ' : 'DISABLED'}  → ${r.account}  cap ${cap}  ${today}  last seen ${r.lastSeen || 'never'}`);
+          const backstop = r.dailyTokenCap === 'unlimited' ? 'unlimited' : Number(r.dailyTokenCap).toLocaleString('en-US');
+          const share = r.tokensToday == null ? '?' : r.sharePct == null ? 'n/a (no fresh weekly reading)' : `${r.sharePct.toFixed(1)}%`;
+          const today = r.tokensToday == null ? 'server not reachable' : `${r.tokensToday.toLocaleString('en-US')}/${backstop} backstop tokens, ${r.requestsToday} req today`;
+          const locked = r.locked == null ? '?' : r.locked ? 'LOCKED until 00:00 UTC' : 'no';
+          console.log(`  ${r.name}  ${r.enabled ? 'enabled ' : 'DISABLED'}  → ${r.account}`);
+          console.log(`      share today ${share} of weekly / cap ${r.capPct}%   locked ${locked}`);
+          console.log(`      ${today}   last seen ${r.lastSeen || 'never'}`);
         }
         return;
       }
@@ -173,14 +192,17 @@ export async function guestCommand(argv) {
         if (!name || !NAME_RE.test(name)) return fail(GUEST_USAGE);
         const account = flags.account;
         if (!account) return fail('add needs --account <account name or email> (the one account this key may use).');
-        const cap = parseCap(flags.cap);
+        const cap = flags.cap === undefined ? undefined : parseCap(flags.cap);
+        const pct = flags.pct === undefined ? undefined : parsePct(flags.pct);
         const key = newGuestKey();
         let exists = false;
         const config = await atomicConfigUpdate((/** @type {any} */ c) => {
           if (findKey(c, name)) { exists = true; return; }
           c.guests ??= {};
           c.guests.keys ??= [];
-          c.guests.keys.push({ name, keyHash: hashGuestKey(key), account, dailyTokenCap: cap, enabled: true });
+          c.guests.keys.push({ name, keyHash: hashGuestKey(key), account,
+            ...(pct !== undefined ? { dailyWeeklyPct: pct } : {}),
+            ...(cap !== undefined ? { dailyTokenCap: cap } : {}), enabled: true });
         });
         if (exists) return fail(`A guest key named "${name}" exists; use rotate.`);
         if (!(config.accounts || []).some((/** @type {any} */ a) => a?.name === account || a?.email === account)) {
@@ -218,8 +240,27 @@ export async function guestCommand(argv) {
         const cap = parseCap(pos[1]);
         const config = await updateKey(name, (/** @type {any} */ k) => { k.dailyTokenCap = cap; });
         if (!config) return;
-        console.log(`Guest "${name}" daily cap: ${cap === 'unlimited' ? 'unlimited' : cap.toLocaleString('en-US') + ' tokens'}.`);
+        console.log(`Guest "${name}" token backstop: ${cap === 'unlimited' ? 'unlimited' : cap.toLocaleString('en-US') + ' tokens'}.`);
         await notifyRunningServer(config);
+        return;
+      }
+      case 'pct': {
+        if (!name || pos[1] === undefined) return fail(GUEST_USAGE);
+        const pct = pos[1] === 'default' ? null : parsePct(pos[1]);
+        const config = await updateKey(name, (/** @type {any} */ k) => {
+          if (pct == null) delete k.dailyWeeklyPct; else k.dailyWeeklyPct = pct;
+        });
+        if (!config) return;
+        console.log(`Guest "${name}" daily limit: ${guestPct(findKey(config, name), config.guests)}% of the weekly quota${pct == null ? ' (the default)' : ''}.`);
+        await notifyRunningServer(config);
+        return;
+      }
+      case 'logs': {
+        if (!name) return fail(GUEST_USAGE);
+        const date = flags.date;
+        if (date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) return fail('--date wants YYYY-MM-DD (UTC).');
+        const config = await loadConfig() || {};
+        console.log(await renderGuestTranscript({ dir: guestLogDir(config), guest: name, date: date ?? null }));
         return;
       }
       case 'remove': {

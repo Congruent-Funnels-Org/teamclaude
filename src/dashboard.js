@@ -773,7 +773,7 @@ ${SHARED_HELPERS}
     var table = document.getElementById('guests');
     table.textContent = '';
     var hr = el('tr');
-    ['Guest', 'Account', 'State', 'Tokens today', 'Cap', 'Req today', 'Last seen'].forEach(function (h, i) {
+    ['Guest', 'Account', 'State', 'Weekly share today', 'Tokens today', 'Backstop', 'Req today', 'Last seen'].forEach(function (h, i) {
       hr.appendChild(el('th', i > 2 ? 'num' : '', h));
     });
     table.appendChild(hr);
@@ -781,9 +781,10 @@ ${SHARED_HELPERS}
       var tr = el('tr');
       tr.appendChild(el('td', '', k.name));
       tr.appendChild(el('td', '', k.account || '—'));
-      tr.appendChild(el('td', '', k.enabled ? 'enabled' : 'disabled'));
+      tr.appendChild(el('td', '', !k.enabled ? 'disabled' : k.locked ? 'locked (00:00 UTC)' : 'enabled'));
+      tr.appendChild(el('td', 'num', (k.sharePct == null ? 'n/a' : k.sharePct.toFixed(1) + '%') + ' / ' + (k.capPct == null ? '?' : k.capPct + '%')));
       tr.appendChild(el('td', 'num', fmtNum(k.tokensToday || 0)));
-      tr.appendChild(el('td', 'num', k.dailyTokenCap === 'unlimited' ? 'unlimited' : k.dailyTokenCap ? fmtNum(k.dailyTokenCap) : 'none (refused)'));
+      tr.appendChild(el('td', 'num', k.dailyTokenCap === 'unlimited' ? 'unlimited' : k.dailyTokenCap ? fmtNum(k.dailyTokenCap) : '—'));
       tr.appendChild(el('td', 'num', fmtNum(k.requestsToday || 0)));
       tr.appendChild(el('td', 'num', k.lastSeen ? fmtAgo(k.lastSeen) : '—'));
       table.appendChild(tr);

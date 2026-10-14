@@ -10,7 +10,18 @@ import {
   isAllowedGuestRoute, isWildcardHost, utcDay, secondsToUtcMidnight, checkGuestBody,
   guestHostProblem, guestCap, estimateRequestTokens, scrubErrorBody, GUEST_DEFAULTS,
   findRemoteSource, stripLongContextBetas, zeroCacheFigures, guestBetas, mediaMinimum,
+  weighTokens, guestPct,
 } from '../src/guest.js';
+import { pruneGuestLogs, renderGuestTranscript } from '../src/guest-log.js';
+
+// Guest stream logs default ON and to ~/.local/share: every test here writes
+// under a temp dir instead (guest-log.js reads XDG_DATA_HOME per request).
+{
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), 'tc-guest-xdg-'));
+}
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -85,11 +96,11 @@ test('only one literal tailnet/loopback IP may be the listen host', () => {
   }
 });
 
-test('a missing or zero cap fails closed; "unlimited" is explicit', () => {
-  assert.equal(guestCap({}), null);
-  assert.equal(guestCap({ dailyTokenCap: 0 }), null);
-  assert.equal(guestCap({ dailyTokenCap: -5 }), null);
-  assert.equal(guestCap({ dailyTokenCap: 'lots' }), null);
+test('the token cap is a backstop: missing or unusable = 100M; "unlimited" is explicit', () => {
+  assert.equal(guestCap({}), 100_000_000);
+  assert.equal(guestCap({ dailyTokenCap: 0 }), 100_000_000);
+  assert.equal(guestCap({ dailyTokenCap: -5 }), 100_000_000);
+  assert.equal(guestCap({ dailyTokenCap: 'lots' }), 100_000_000);
   assert.equal(guestCap({ dailyTokenCap: 3000000 }), 3000000);
   assert.equal(guestCap({ dailyTokenCap: 'unlimited' }), Infinity);
 });
@@ -440,12 +451,12 @@ test('teamclaude status renders a Guests section', async () => {
 
 // ── bounce 1: caps, limits, leaks ───────────────────────────────────────────
 
-test('a key with no cap configured is refused (fails closed)', async () => {
+test('a key with no cap configured is served (the usage cap is the limit, 100M backstop)', async () => {
   await withGuest(async ({ port, seen }) => {
     const res = await ask(port);
-    assert.equal(res.status, 403);
+    assert.equal(res.status, 200);
     await res.text();
-    assert.equal(seen.length, 0);
+    assert.equal(seen.length, 1);
   }, { guests: guestsConfig({ dailyTokenCap: undefined }) });
 });
 
@@ -471,8 +482,9 @@ test('parallel requests at the cap edge cannot all slip under it', async () => {
   }, { upstreamFor: { ai: slow }, guests: guestsConfig({ dailyTokenCap: 120, maxConcurrent: 5 }) });
 });
 
-test('at most maxConcurrent (default 2) requests per key are in flight', async () => {
-  assert.equal(GUEST_DEFAULTS.maxConcurrent, 2);
+test('at most maxConcurrent (default 8) requests per key are in flight', async () => {
+  assert.equal(GUEST_DEFAULTS.maxConcurrent, 8);
+  assert.equal(GUEST_DEFAULTS.requestsPerMinute, 240);
   await withGuest(async ({ port, seen }) => {
     const results = await Promise.all([ask(port), ask(port), ask(port), ask(port)]);
     const statuses = results.map(r => r.status);
@@ -484,7 +496,7 @@ test('at most maxConcurrent (default 2) requests per key are in flight', async (
     const after = await ask(port);
     await after.text();
     assert.equal(after.status, 200);
-  }, { upstreamFor: { ai: slow } });
+  }, { upstreamFor: { ai: slow }, guests: guestsConfig({ maxConcurrent: 2 }) });
 });
 
 test('requests per minute are limited per key, count_tokens included', async () => {
@@ -622,13 +634,23 @@ test('input a server-side round adds after message_start is booked from message_
   }, { upstreamFor: { ai: grow } });
 });
 
-test('server-side tools and MCP servers are refused; custom tools pass', async () => {
+test('web search / web fetch pass; code execution, advisor and MCP servers are refused; custom tools pass', async () => {
   await withGuest(async ({ port, seen }) => {
     const mk = (extra) => JSON.stringify({ model: 'm', max_tokens: 16, messages: [], ...extra });
     for (const extra of [
-      { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+      { tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }] },
       { tools: [{ name: 'Read', input_schema: {} }, { type: 'web_fetch_20250910', name: 'web_fetch' }] },
+    ]) {
+      const r = await ask(port, { body: mk(extra) });
+      assert.equal(r.status, 200, JSON.stringify(extra));
+      await r.text();
+    }
+    assert.equal(seen.length, 2);
+    seen.length = 0;
+    for (const extra of [
       { tools: [{ type: 'code_execution_20250825', name: 'code_execution' }] },
+      { tools: [{ type: 'bash_code_execution_20250825', name: 'bash' }] },
+      { tools: [{ type: 'web_search_20250305x', name: 'web_search' }] },
       { tools: [{ type: 'advisor_20260301', name: 'advisor' }] },
       { tools: 'web_search' },
       { mcp_servers: [{ type: 'url', url: 'https://x', name: 'x' }] },
@@ -788,7 +810,8 @@ test('usage crossing 90% of the cap is persisted at once', async () => {
 // ── bounce 4: compaction, beta allow-list, media floors ─────────────────────
 
 test('betas are allow-listed; the OAuth beta is added for a subscription pin', () => {
-  assert.equal(guestBetas('files-api-2025-04-14,mcp-servers-2025-12-04,web-search-2025-03-05,fast-mode-2026-02-01,cache-keepalive-2026-09-03,context-1m-2025-08-07,message-threads-2026-08-12'), undefined);
+  assert.equal(guestBetas('web-search-2025-03-05,web-fetch-2025-09-10'), 'web-search-2025-03-05,web-fetch-2025-09-10');
+  assert.equal(guestBetas('files-api-2025-04-14,mcp-servers-2025-12-04,code-execution-2025-08-25,fast-mode-2026-02-01,cache-keepalive-2026-09-03,context-1m-2025-08-07,message-threads-2026-08-12'), undefined);
   assert.equal(guestBetas('claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24,files-api-2025-04-14'), 'claude-code-20250219,interleaved-thinking-2025-05-14,effort-2025-11-24');
   assert.equal(guestBetas(undefined, { oauth: true }), 'oauth-2025-04-20');
   assert.equal(guestBetas('oauth-2025-04-20', { oauth: true }), 'oauth-2025-04-20');
@@ -909,4 +932,309 @@ test('guest CLI: a running server that fails the reload makes the command exit n
     assert.equal(r3.status, 0, r3.stdout + r3.stderr);
     assert.match(r3.stdout, /No server running/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── KAN-3837 usage: % of weekly cap, web search, stream logs ────────────────
+
+test('weighTokens: cost-weighted (input 1, cache write 1.25 / 1h 2, cache read 0.1, output 5)', () => {
+  assert.equal(weighTokens({ input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 40 }), 100 + 50 + 100 + 50);
+  assert.equal(weighTokens({ cache_creation_input_tokens: 40, cache_creation: { ephemeral_1h_input_tokens: 10 } }), 30 * 1.25 + 10 * 2);
+  assert.equal(weighTokens(null), 0);
+  assert.equal(weighTokens({ input_tokens: -5, output_tokens: 'x' }), 0);
+});
+
+test('guestPct: key override, then guests.dailyWeeklyPct, then 30', () => {
+  assert.equal(guestPct({}, {}), 30);
+  assert.equal(guestPct({}, { dailyWeeklyPct: 20 }), 20);
+  assert.equal(guestPct({ dailyWeeklyPct: 45 }, { dailyWeeklyPct: 20 }), 45);
+  assert.equal(guestPct({ dailyWeeklyPct: 0 }, { dailyWeeklyPct: 500 }), 30);
+});
+
+test('share % = weekly rise today × guest weighted / account weighted', () => {
+  let now = Date.UTC(2026, 9, 15, 10, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.observeWeekly('ai', 0.20, Date.UTC(2026, 9, 20), now);       // baseline
+  t.recordAccountWeighted('ai', 1000);
+  t.recordGuestWeighted('nephew', 250);
+  now += 60_000;
+  t.observeWeekly('ai', 0.60, Date.UTC(2026, 9, 20), now);       // +40 points
+  const s = t.share('nephew', 'ai');
+  assert.equal(s.stale, false);
+  assert.ok(Math.abs(s.pct - 10) < 1e-9, String(s.pct));         // 40 × 0.25
+  assert.ok(Math.abs(s.risePct - 40) < 1e-9);
+  // an older reading never rewinds
+  t.observeWeekly('ai', 0.30, Date.UTC(2026, 9, 20), now - 30_000);
+  assert.ok(Math.abs(t.share('nephew', 'ai').pct - 10) < 1e-9);
+});
+
+test('share %: a weekly reset inside the day keeps what was used before it', () => {
+  let now = Date.UTC(2026, 9, 15, 1, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.recordAccountWeighted('ai', 100);
+  t.recordGuestWeighted('n', 100);
+  t.observeWeekly('ai', 0.90, Date.UTC(2026, 9, 15, 12), now);
+  now += 3600_000;
+  t.observeWeekly('ai', 0.95, Date.UTC(2026, 9, 15, 12), now);   // +5
+  now = Date.UTC(2026, 9, 15, 13);
+  t.observeWeekly('ai', 0.04, Date.UTC(2026, 9, 22, 12), now);   // reset: new window at 4
+  assert.ok(Math.abs(t.share('n', 'ai').pct - 9) < 1e-9, String(t.share('n', 'ai').pct));
+  now += 60_000;
+  t.observeWeekly('ai', 0.10, Date.UTC(2026, 9, 22, 12), now);   // +6
+  assert.ok(Math.abs(t.share('n', 'ai').pct - 15) < 1e-9);
+  // a drop without a moved reset time is a reset too
+  const u = new GuestUsageTracker({ now: () => now });
+  u.recordAccountWeighted('ai', 1); u.recordGuestWeighted('n', 1);
+  u.observeWeekly('ai', 0.50, null, now);
+  u.observeWeekly('ai', 0.55, null, now + 1);
+  u.observeWeekly('ai', 0.03, null, now + 2);
+  assert.ok(Math.abs(u.share('n', 'ai').pct - 8) < 1e-9);
+});
+
+test('share %: a stale or missing weekly reading gives no share (backstop only)', () => {
+  let now = Date.UTC(2026, 9, 15, 10, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  assert.equal(t.share('n', 'ai').pct, null);
+  assert.equal(t.share('n', 'ai').stale, true);
+  t.observeWeekly('ai', 0.2, null, now);
+  assert.equal(t.share('n', 'ai').stale, false);
+  now += 16 * 60_000;
+  assert.equal(t.share('n', 'ai').pct, null);
+  assert.equal(t.share('n', 'ai').stale, true);
+});
+
+test('share counters, weekly rise and the lock survive a restart (export → JSON → restore)', () => {
+  const now = Date.UTC(2026, 9, 15, 10, 0);
+  const t = new GuestUsageTracker({ now: () => now });
+  t.observeWeekly('ai', 0.1, null, now);
+  t.observeWeekly('ai', 0.3, null, now);
+  t.recordAccountWeighted('ai', 400); t.recordGuestWeighted('n', 100); t.recordTokens('n', 77); t.lock('n');
+  const saved = JSON.parse(JSON.stringify({ guests: t.export(), guestAccounts: t.exportAccounts() }));
+  const r = new GuestUsageTracker({ now: () => now });
+  r.restore(saved.guests, saved.guestAccounts);
+  assert.ok(Math.abs(r.share('n', 'ai').pct - 5) < 1e-9);
+  assert.equal(r.lockedToday('n'), true);
+  assert.equal(r.tokensToday('n'), 77);
+  // next UTC day: unlocked, today's figures start over
+  const next = new GuestUsageTracker({ now: () => now + 86_400_000 });
+  next.restore(saved.guests, saved.guestAccounts);
+  assert.equal(next.lockedToday('n'), false);
+  assert.equal(next.share('n', 'ai').risePct, 0);
+});
+
+test('lock: once the share reaches the cap the guest gets 429 + retry-after to 00:00 UTC, for the rest of the day', async () => {
+  let util = 0.10;
+  const metered = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-7d-utilization': String(util),
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor(Date.now() / 1000) + 5 * 86400) });
+    res.end(JSON.stringify({ type: 'message', content: [], usage: { input_tokens: 10, output_tokens: 5 } }));
+  };
+  let persisted = 0;
+  await withGuest(async ({ port, guestUsage, logs, am }) => {
+    const r1 = await ask(port); await r1.text();                  // baseline 10%
+    assert.equal(r1.status, 200);
+    util = 0.50;
+    const r2 = await ask(port); await r2.text();                  // +40 points, all the guest's
+    assert.equal(r2.status, 200);
+    assert.ok(am.accounts[1].quota.unified7dSeenAt > 0);
+    const s = guestStatus({ guests: guestsConfig() }, guestUsage, null, am).keys[0];
+    assert.ok(Math.abs(s.sharePct - 40) < 0.01, JSON.stringify(s));
+    assert.equal(s.capPct, 30);
+    assert.equal(s.locked, false);
+    const r3 = await ask(port);
+    assert.equal(r3.status, 429);
+    const body = await r3.json();
+    assert.equal(body.error.type, 'rate_limit_error');
+    assert.equal(body.error.message, 'Daily limit reached. It resets at 00:00 UTC.');
+    const ra = Number(r3.headers.get('retry-after'));
+    assert.ok(ra > 0 && Math.abs(ra - secondsToUtcMidnight()) <= 2, String(ra));
+    assert.equal(guestUsage.lockedToday('nephew'), true);
+    assert.ok(logs.some(l => /daily usage cap reached \(40\.0%/.test(l)), logs.join('\n'));
+    assert.ok(persisted >= 1);
+    // stays locked even if the share would now read lower
+    util = 0.50;
+    const r4 = await ask(port); await r4.text();
+    assert.equal(r4.status, 429);
+    assert.equal(guestStatus({ guests: guestsConfig() }, guestUsage, null, am).keys[0].locked, true);
+  }, { upstreamFor: { ai: metered }, persist: () => { persisted += 1; } });
+});
+
+test('lock: Jan\'s own traffic on the account dilutes the guest share; a per-key pct raises the cap', async () => {
+  let util = 0.10;
+  const metered = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-7d-utilization': String(util) });
+    res.end(JSON.stringify({ type: 'message', content: [], usage: { input_tokens: 10, output_tokens: 5 } }));
+  };
+  await withGuest(async ({ port, guestUsage, am }) => {
+    const r1 = await ask(port); await r1.text();
+    util = 0.50;
+    // the owner spends 3× the guest on the same account (weighted 35 per message)
+    for (let i = 0; i < 3; i++) am.recordTokenUsage(1, null, 'claude-haiku-4-5', { input_tokens: 10, output_tokens: 5 });
+    const r2 = await ask(port); await r2.text();
+    const s = guestStatus({ guests: guestsConfig() }, guestUsage, null, am).keys[0];
+    // rise 40 × guest 70 / all 175 = 16%
+    assert.ok(Math.abs(s.sharePct - 16) < 0.01, JSON.stringify(s));
+    const r3 = await ask(port); await r3.text();
+    assert.equal(r3.status, 200);
+  }, { upstreamFor: { ai: metered } });
+  util = 0.10;
+  await withGuest(async ({ port }) => {
+    const r1 = await ask(port); await r1.text();
+    util = 0.50;
+    const r2 = await ask(port); await r2.text();
+    const r3 = await ask(port); await r3.text();
+    assert.equal(r3.status, 200);                                // 40% < 50%
+  }, { upstreamFor: { ai: metered }, guests: guestsConfig({ dailyWeeklyPct: 50 }) });
+});
+
+test('lock: a stale weekly reading is not acted on: backstop only, logged once', async () => {
+  await withGuest(async ({ port, logs, am, guestUsage }) => {
+    for (let i = 0; i < 3; i++) { const r = await ask(port); await r.text(); assert.equal(r.status, 200); }
+    assert.equal(logs.filter(l => /no fresh weekly reading/.test(l)).length, 1, logs.join('\n'));
+    assert.equal(am.accounts[1].quota.unified7dSeenAt, null);
+    assert.equal(guestStatus({ guests: guestsConfig() }, guestUsage, null, am).keys[0].sharePct, null);
+  });
+});
+
+test('stream logs: full request + response saved 0600 in 0700 dirs, auth and the guest key stripped', async () => {
+  const { mkdtempSync, readdirSync, readFileSync, statSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-streams-'));
+  const sse = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":12,"cache_read_input_tokens":900,"output_tokens":1}}}\n\n');
+    res.write('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n');
+    res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}\n\n');
+    res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}\n\n');
+    res.write('event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","name":"web_search","input":{}}}\n\n');
+    res.write('event: content_block_start\ndata: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","name":"Bash","input":{}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7,"server_tool_use":{"web_search_requests":1}}}\n\n');
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  };
+  try {
+    await withGuest(async ({ port, guestUsage }) => {
+      const body = JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 64, stream: true,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'what is the weather' }] }] });
+      const r = await ask(port, { body, headers: { authorization: `Bearer ${KEY}`, cookie: 'c=1', 'anthropic-beta': 'web-search-2025-03-05', 'x-extra': KEY } });
+      const got = await r.text();
+      assert.equal(r.status, 200);
+      assert.match(got, /"cache_read_input_tokens":0/);           // the guest sees it zeroed
+      const refused = await ask(port, { body: JSON.stringify({ model: 'm', max_tokens: 5, messages: [], tools: [{ type: 'code_execution_20250825', name: 'c' }] }) });
+      await refused.text();
+      await new Promise(res => setTimeout(res, 100));
+      const gdir = join(dir, 'nephew');
+      assert.equal(statSync(dir).mode & 0o777, 0o700);
+      assert.equal(statSync(gdir).mode & 0o777, 0o700);
+      const days = readdirSync(gdir);
+      assert.equal(days.length, 1);
+      const ddir = join(gdir, days[0]);
+      assert.equal(statSync(ddir).mode & 0o777, 0o700);
+      const files = readdirSync(ddir).sort();
+      assert.equal(files.length, 4, files.join(','));
+      for (const f of files) {
+        assert.match(f, /^\d{6}-[0-9a-f]{8}\.(req\.json|res\.sse)$/);
+        assert.equal(statSync(join(ddir, f)).mode & 0o777, 0o600, f);
+        const text = readFileSync(join(ddir, f), 'utf8');
+        assert.ok(!text.includes(KEY), `${f} carries the guest key`);
+        assert.ok(!/t-ai|t-jan|authorization|cookie/i.test(text), `${f} carries a credential`);
+      }
+      const reqs = files.filter(f => f.endsWith('.req.json')).map(f => JSON.parse(readFileSync(join(ddir, f), 'utf8')));
+      const main = reqs.find(q => q.body.stream);
+      assert.equal(main.body.messages[0].content[0].text, 'what is the weather');
+      assert.equal(main.headers['anthropic-beta'], 'web-search-2025-03-05');
+      assert.equal(main.headers['x-extra'], undefined);
+      const sseFile = readFileSync(join(ddir, files.find(f => f.endsWith('.res.sse') && f.startsWith(files.find(x => x.endsWith('.req.json') && JSON.parse(readFileSync(join(ddir, x), 'utf8')).body.stream).slice(0, 15)))), 'utf8');
+      assert.match(sseFile, /"cache_read_input_tokens":900/);       // as received
+      assert.match(sseFile, /message_stop/);
+      assert.ok(guestUsage.tokensToday('nephew') > 0);
+      // the readable transcript
+      const out = await renderGuestTranscript({ dir, guest: 'nephew' });
+      assert.match(out, /2 request\(s\)/);
+      assert.match(out, /USER: what is the weather/);
+      assert.match(out, /ASSISTANT: Hello there/);
+      assert.match(out, /TOOLS: web_search, Bash/);
+      assert.match(out, /TOKENS: in 12 · cache write 0 · cache read 900 · out 7 · web searches 1/);
+      assert.match(out, /ERROR: Only web search and web fetch/);
+      assert.match(await renderGuestTranscript({ dir, guest: 'nephew', date: '2001-01-01' }), /No logs .* on 2001-01-01/);
+      assert.match(await renderGuestTranscript({ dir, guest: 'nobody' }), /No logs for guest "nobody"/);
+    }, { upstreamFor: { ai: sse }, guests: { ...guestsConfig(), logDir: dir } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream logs: off with guests.logBodies false; a write error never fails the request', async () => {
+  const { mkdtempSync, readdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-streams-'));
+  try {
+    await withGuest(async ({ port }) => {
+      const r = await ask(port); await r.text();
+      assert.equal(r.status, 200);
+      assert.deepEqual(readdirSync(dir), []);
+    }, { guests: { ...guestsConfig(), logDir: dir, logBodies: false } });
+    // logDir is a FILE: every write fails, the request is still served
+    const file = join(dir, 'not-a-dir');
+    writeFileSync(file, 'x');
+    await withGuest(async ({ port, logs }) => {
+      const r = await ask(port); await r.text();
+      assert.equal(r.status, 200);
+      await new Promise(res => setTimeout(res, 50));
+      assert.ok(logs.some(l => /stream log write failed/.test(l)), logs.join('\n'));
+    }, { guests: { ...guestsConfig(), logDir: file } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('stream log prune: retention days, then the size backstop (oldest days first)', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'tc-guest-prune-'));
+  const now = Date.UTC(2026, 9, 15, 12);
+  const mk = (g, day, bytes) => { mkdirSync(join(dir, g, day), { recursive: true }); writeFileSync(join(dir, g, day, '000000-aaaaaaaa.res.sse'), Buffer.alloc(bytes)); };
+  try {
+    mk('nephew', '2026-06-01', 10);     // > 90 days
+    mk('nephew', '2026-10-10', 600_000);
+    mk('other', '2026-10-12', 600_000);
+    mk('nephew', '2026-10-15', 300_000);
+    mkdirSync(join(dir, 'nephew', 'not-a-day'));
+    const r = await pruneGuestLogs({ dir, retentionDays: 90, maxMB: 1, now });
+    assert.equal(existsSync(join(dir, 'nephew', '2026-06-01')), false);
+    assert.equal(existsSync(join(dir, 'nephew', '2026-10-10')), false); // oldest goes for size
+    assert.equal(existsSync(join(dir, 'other', '2026-10-12')), true);
+    assert.equal(existsSync(join(dir, 'nephew', '2026-10-15')), true);
+    assert.equal(existsSync(join(dir, 'nephew', 'not-a-day')), true);
+    assert.equal(r.removed.length, 2);
+    assert.ok(r.bytes <= 1024 * 1024);
+    assert.deepEqual((await pruneGuestLogs({ dir: join(dir, 'missing') })).removed, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('guest CLI: logs renders a transcript; pct sets the per-key cap', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const home = mkdtempSync(join(tmpdir(), 'tc-guest-cli-'));
+  const logDir = join(home, 'logs');
+  const cfgDir = join(home, 'cfg');
+  mkdirSync(cfgDir, { recursive: true });
+  const cfgPath = join(cfgDir, 'teamclaude.json');
+  writeFileSync(cfgPath, JSON.stringify({ accounts: [], guests: { logDir, keys: [{ name: 'nephew', keyHash: hashGuestKey(KEY), account: 'ai' }] } }));
+  const day = join(logDir, 'nephew', '2026-10-14');
+  mkdirSync(day, { recursive: true });
+  writeFileSync(join(day, '101500-abcdef01.req.json'), JSON.stringify({ at: '2026-10-14T10:15:00.000Z', url: '/v1/messages', body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello?' }] } }));
+  writeFileSync(join(day, '101500-abcdef01.res.sse'), JSON.stringify({ type: 'message', model: 'claude-haiku-4-5', content: [{ type: 'text', text: 'hi!' }], usage: { input_tokens: 3, output_tokens: 2 } }));
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: home, TEAMCLAUDE_CONFIG: cfgPath };
+  try {
+    const run = (...args) => spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'index.js'), 'guest', ...args], { env, encoding: 'utf8', timeout: 20_000 });
+    const out = run('logs', 'nephew', '--date', '2026-10-14');
+    assert.equal(out.status, 0, out.stderr);
+    assert.match(out.stdout, /USER: hello\?/);
+    assert.match(out.stdout, /ASSISTANT: hi!/);
+    assert.match(out.stdout, /TOKENS: in 3 · cache write 0 · cache read 0 · out 2/);
+    const pct = run('pct', 'nephew', '25');
+    assert.equal(pct.status, 0, pct.stderr);
+    assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).guests.keys[0].dailyWeeklyPct, 25);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

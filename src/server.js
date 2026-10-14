@@ -1347,14 +1347,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 // A guest request (guest.js) books its tokens, cache included, against its own
 // daily cap through the same hook the per-client counters use.
 /**
- * @param {((i: number, o: number, c?: number, cumulative?: any) => void)|null} onUsage
+ * @param {((i: number, o: number, c?: number, cumulative?: any, raw?: any) => void)|null} onUsage
  * @param {unknown} guestUsage
  */
 function withGuestUsage(onUsage, guestUsage) {
   if (typeof guestUsage !== 'function') return onUsage;
-  return (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache, /** @type {any} */ cumulative) => {
+  return (/** @type {number} */ input, /** @type {number} */ output, /** @type {number} */ cache, /** @type {any} */ cumulative, /** @type {any} */ raw) => {
     onUsage?.(input, output, cache);
-    guestUsage(input, output, cache, cumulative);
+    guestUsage(input, output, cache, cumulative, raw);
   };
 }
 
@@ -3397,7 +3397,7 @@ function cacheTokensOf(usage) {
  * @param {string} line
  * @param {number} accountIndex
  * @param {any} accountManager
- * @param {((inputTokens: number, outputTokens: number, cacheTokens?: number, cumulative?: any) => void)|null} [onUsage]
+ * @param {((inputTokens: number, outputTokens: number, cacheTokens?: number, cumulative?: any, raw?: any) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
  */
@@ -3408,7 +3408,8 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     const data = JSON.parse(line.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      onUsage?.(data.message.usage.input_tokens || 0, 0, cacheTokensOf(data.message.usage));
+      // The raw figures ride along (5th) for the guest's cost-weighted share.
+      onUsage?.(data.message.usage.input_tokens || 0, 0, cacheTokensOf(data.message.usage), undefined, data.message.usage);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);

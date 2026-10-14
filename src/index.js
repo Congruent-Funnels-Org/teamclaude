@@ -308,10 +308,11 @@ async function serverCommand() {
   if (savedState?.clients) clientUsage.restore(savedState.clients);
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
-  // Guest keys' counters (config.guests): today's tokens are what the daily cap
-  // reads, so they survive a restart like the per-client counters.
+  // Guest keys' counters (config.guests): today's tokens, share and lock, and
+  // the pinned accounts' weekly rise today, are what the daily caps read, so
+  // they survive a restart like the per-client counters.
   const guestUsage = new GuestUsageTracker();
-  if (savedState?.guests) guestUsage.restore(savedState.guests);
+  if (savedState?.guests || savedState?.guestAccounts) guestUsage.restore(savedState.guests, savedState.guestAccounts);
   /** @type {ReturnType<typeof startGuestListener>|null} */
   let guestListener = null;
 
@@ -321,7 +322,7 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export(), guests: guestUsage.export() })
+    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.export(), usageDimensions: dimensionUsage.export(), guests: guestUsage.export(), guestAccounts: guestUsage.exportAccounts() })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
 
@@ -460,10 +461,14 @@ async function serverCommand() {
     // Both are read per request off this object (server.js) and the TUI already
     // persists them; without this a hand edit or another writer waited for a restart.
     config.eventLogging = diskConfig.eventLogging || 'hide';
-    // Guest keys are read per request, so add/rotate/disable is a reload. The
-    // listen address is a socket: a change to it waits for a restart.
+    // Guest keys and settings (dailyWeeklyPct, logs) are read per request, so
+    // add/rotate/disable/cap is a reload. The listen address is a socket: a
+    // change to it waits for a restart.
     if (diskConfig.guests || config.guests) {
-      config.guests = { ...(config.guests || {}), keys: diskConfig.guests?.keys || [] };
+      const listen = config.guests?.listen;
+      config.guests = { ...(diskConfig.guests || {}), keys: diskConfig.guests?.keys || [] };
+      delete config.guests.listen;
+      if (listen) config.guests.listen = listen;
     }
     // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
     config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
@@ -614,7 +619,7 @@ async function serverCommand() {
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
     // Guest keys (config.guests): counters + cap per key, never a key or hash.
-    guests: guestStatus(config, guestUsage, guestListener?.state ?? null),
+    guests: guestStatus(config, guestUsage, guestListener?.state ?? null, accountManager),
     server: {
       version: serverVersion,
       versionLabel,
