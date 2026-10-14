@@ -714,7 +714,7 @@ async function serverCommand() {
   // The guest door (config.guests.listen), off unless configured. Its own
   // server on its own address; it retries until the address exists and never
   // binds anything else.
-  guestListener = startGuestListener({ accountManager, config, hooks, sx, guestUsage });
+  guestListener = startGuestListener({ accountManager, config, hooks, sx, guestUsage, persist: persistQuotaState });
 
   // Reflect the active account in the terminal title so a backgrounded/tabbed
   // server is glanceable. Works in both TUI and headless modes.

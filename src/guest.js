@@ -47,7 +47,7 @@ export const GUEST_RETRY_BIND_MS = 10_000;
 export const GUEST_DEFAULTS = {
   maxConcurrent: 2,          // per key, in flight at once
   requestsPerMinute: 60,     // per key, every allowed route (count_tokens too)
-  maxBodyBytes: 32 * 1024 * 1024,
+  maxBodyBytes: 8 * 1024 * 1024,
   maxConnections: 16,        // whole listener
   headersTimeoutMs: 15_000,
   requestTimeoutMs: 120_000, // receiving the request; a streamed answer may run longer
@@ -68,8 +68,10 @@ const MODEL_ID_RE = /^\/v1\/models\/[A-Za-z0-9._:@-]{1,128}$/;
 const STRIPPED_REQUEST_HEADERS = ['authorization', 'x-api-key', 'proxy-authorization', 'cookie'];
 // Response headers a guest may see; everything else (organization ids, cookies,
 // auth challenges, proxy diagnostics) is dropped.
-const ALLOWED_RESPONSE_HEADERS = new Set(['content-type', 'content-length', 'content-encoding', 'cache-control',
-  'date', 'request-id', 'x-request-id', 'retry-after']);
+// No content-length / content-encoding: the forwarder hands over decompressed
+// bytes, and the cache figures in them are rewritten (see guardResponse).
+const ALLOWED_RESPONSE_HEADERS = new Set(['content-type', 'cache-control',
+  'date', 'request-id', 'x-request-id', 'retry-after', 'x-should-retry']);
 const isAllowedResponseHeader = (/** @type {string} */ name) => {
   const n = String(name).toLowerCase();
   // Not anthropic-ratelimit-*: those publish the pinned account's quota state.
@@ -162,6 +164,47 @@ function keyLimit(key, field) {
 
 export const MAX_GUEST_MAX_TOKENS = 128_000;
 
+/**
+ * The first content block (at any depth, tool_result content included) whose
+ * content lives somewhere else: a url or file source, or a file_id. Returns a
+ * short description, or null.
+ * @param {unknown} node @param {number} [depth]
+ * @returns {string|null}
+ */
+export function findRemoteSource(node, depth = 0) {
+  if (node == null || typeof node !== 'object' || depth > 64) return null;
+  if (Array.isArray(node)) {
+    for (const x of node) { const r = findRemoteSource(x, depth + 1); if (r) return r; }
+    return null;
+  }
+  const o = /** @type {Record<string, any>} */ (node);
+  if ('file_id' in o) return 'file_id';
+  const src = o.source;
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
+    const t = String(src.type ?? '');
+    if (t !== 'base64' && t !== 'text' && t !== 'content') return `source type "${t || '?'}"`;
+  }
+  if (typeof o.type === 'string' && /^(container_upload|search_result_location|mcp_)/.test(o.type)) return `block type "${o.type}"`;
+  for (const [k, v] of Object.entries(o)) {
+    // A tool_use block's input is the model's own arguments (any shape at
+    // all, a "source" field included), not content: not walked.
+    if (k === 'input' && o.type === 'tool_use') continue;
+    if (v && typeof v === 'object') { const r = findRemoteSource(v, depth + 1); if (r) return r; }
+  }
+  return null;
+}
+
+/**
+ * The anthropic-beta header minus any long-context beta (context-1m-*): the
+ * reservation is sized for the standard window.
+ * @param {unknown} value @returns {string|undefined}
+ */
+export function stripLongContextBetas(value) {
+  if (value == null) return undefined;
+  const kept = String(value).split(',').map(x => x.trim()).filter(x => x && !/^context-1m/i.test(x));
+  return kept.length ? kept.join(',') : undefined;
+}
+
 /** A tool the CLIENT runs (name + input_schema, no type or type "custom"). @param {any} t */
 function isCustomTool(t) {
   return t && typeof t === 'object' && (t.type == null || t.type === 'custom');
@@ -188,6 +231,13 @@ export function checkGuestBody(pathname, headers, body) {
     return { ok: false, status: 400, type: 'invalid_request_error', message: 'Server-side tools (web search, web fetch, code execution, advisor) are not available through this relay.' };
   }
   if (json.tools != null && !Array.isArray(json.tools)) return { ok: false, status: 400, type: 'invalid_request_error', message: 'tools must be a list.' };
+  // Anything that makes the real input much bigger than the bytes sent: input
+  // fetched or stored server-side is invisible to the bytes/3 estimate.
+  for (const field of ['thread', 'container']) {
+    if (json[field] != null) return { ok: false, status: 400, type: 'invalid_request_error', message: `"${field}" is not available through this relay.` };
+  }
+  const remote = findRemoteSource(json.messages) || findRemoteSource(json.system);
+  if (remote) return { ok: false, status: 400, type: 'invalid_request_error', message: `Content by reference (${remote}) is not available through this relay: send the content itself.` };
   if (json.mcp_servers != null && !(Array.isArray(json.mcp_servers) && json.mcp_servers.length === 0)) {
     return { ok: false, status: 400, type: 'invalid_request_error', message: 'MCP servers are not available through this relay.' };
   }
@@ -391,6 +441,18 @@ function guardResponse(res, identifiers) {
   let held = null;
   let heldBytes = 0;
   let status = 200;
+  // A success body is passed through line by line (whole lines only, so a
+  // figure is never split) with its prompt-cache figures zeroed: the account's
+  // cache is shared with its owner, and a cache hit would tell the guest that a
+  // guessed prefix matches the owner's prompts. Booked before this, unchanged.
+  /** @type {Buffer} */
+  let carry = Buffer.alloc(0);
+  const passOn = (/** @type {Buffer} */ b, /** @type {boolean} */ last) => {
+    const all = carry.length ? Buffer.concat([carry, b]) : b;
+    const cut = last ? all.length : all.lastIndexOf(0x0a) + 1;
+    carry = all.subarray(cut);
+    return cut ? zeroCacheFigures(all.subarray(0, cut).toString('utf8')) : '';
+  };
   res.writeHead = (/** @type {number} */ code, /** @type {any[]} */ ...rest) => {
     status = code;
     const args = rest.map(a => {
@@ -403,16 +465,7 @@ function guardResponse(res, identifiers) {
       return Object.fromEntries(Object.entries(a).filter(([k]) => isAllowedResponseHeader(k)));
     });
     for (const name of res.getHeaderNames()) if (!isAllowedResponseHeader(name)) res.removeHeader(name);
-    if (code >= 400) {
-      held = [];
-      // The scrubbed body has its own length.
-      res.removeHeader('content-length');
-      for (const a of args) {
-        if (a && typeof a === 'object' && !Array.isArray(a)) {
-          for (const k of Object.keys(a)) if (/^content-(length|encoding)$/i.test(k)) delete a[k];
-        }
-      }
-    }
+    if (code >= 400) held = [];
     return writeHead(code, ...args);
   };
   const hold = (/** @type {any} */ chunk, /** @type {any} */ enc) => {
@@ -420,19 +473,37 @@ function guardResponse(res, identifiers) {
     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), /** @type {BufferEncoding} */ (typeof enc === 'string' ? enc : 'utf8'));
     if (heldBytes < 256 * 1024) { held?.push(b); heldBytes += b.length; }
   };
+  const asBuffer = (/** @type {any} */ chunk, /** @type {any} */ enc) => (Buffer.isBuffer(chunk) ? chunk
+    : Buffer.from(String(chunk), /** @type {BufferEncoding} */ (typeof enc === 'string' ? enc : 'utf8')));
   res.write = (/** @type {any} */ chunk, /** @type {any} */ enc, /** @type {any} */ cb) => {
-    if (!held) return write(chunk, enc, cb);
+    if (!held) {
+      if (chunk == null || typeof chunk === 'function') return write(chunk, enc, cb);
+      const out = passOn(asBuffer(chunk, enc), false);
+      const done = typeof enc === 'function' ? enc : cb;
+      if (!out) { if (typeof done === 'function') done(); return true; }
+      return write(out, typeof done === 'function' ? done : undefined);
+    }
     hold(chunk, enc);
     if (typeof enc === 'function') enc(); else if (typeof cb === 'function') cb();
     return true;
   };
   res.end = (/** @type {any} */ chunk, /** @type {any} */ enc, /** @type {any} */ cb) => {
-    if (!held) return end(chunk, enc, cb);
+    if (!held) {
+      const done = typeof chunk === 'function' ? chunk : typeof enc === 'function' ? enc : cb;
+      const tail = passOn(chunk == null || typeof chunk === 'function' ? Buffer.alloc(0) : asBuffer(chunk, enc), true);
+      return end(tail || undefined, typeof done === 'function' ? done : undefined);
+    }
     hold(chunk, enc);
     const text = Buffer.concat(held).toString('utf8');
     held = null;
     return end(scrubErrorBody(text, status, identifiers()), typeof cb === 'function' ? cb : (typeof enc === 'function' ? enc : undefined));
   };
+}
+
+const CACHE_FIGURE_RE = /"(cache_read_input_tokens|cache_creation_input_tokens|ephemeral_5m_input_tokens|ephemeral_1h_input_tokens)"(\s*):(\s*)\d+/g;
+/** @param {string} text */
+export function zeroCacheFigures(text) {
+  return text.replace(CACHE_FIGURE_RE, '"$1"$2:$30');
 }
 
 /**
@@ -476,9 +547,19 @@ async function readBody(req, limit) {
 /**
  * The guest request handler. Exported apart from the server so tests can drive
  * it on an ephemeral loopback port.
- * @param {{accountManager: any, config: any, hooks?: any, sx?: any, guestUsage: GuestUsageTracker, upstream?: string|null, log?: (m: string) => void}} opts
+ * @param {{accountManager: any, config: any, hooks?: any, sx?: any, guestUsage: GuestUsageTracker, upstream?: string|null, log?: (m: string) => void, persist?: (() => unknown)|null}} opts
  */
-export function createGuestRequestHandler({ accountManager, config, hooks = {}, sx = null, guestUsage, upstream = null, log = console.log }) {
+export function createGuestRequestHandler({ accountManager, config, hooks = {}, sx = null, guestUsage, upstream = null, log = console.log, persist = null }) {
+  let lastPersist = 0;
+  // Usage near the cap is saved at once (at most every 10 s), so a crash
+  // cannot hand back up to a minute of spend.
+  const persistNearCap = (/** @type {string} */ name, /** @type {number} */ cap) => {
+    if (!persist || !Number.isFinite(cap) || guestUsage.tokensToday(name) < 0.9 * cap) return;
+    const t = Date.now();
+    if (t - lastPersist < 10_000) return;
+    lastPersist = t;
+    try { Promise.resolve(persist()).catch(() => {}); } catch { /* best effort */ }
+  };
   const listeners = new Map(); // "name\0pin" → forwarding listener
   /** @type {Map<string, {inflight: number, reserved: number, recent: number[]}>} */
   const live = new Map();
@@ -569,6 +650,15 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       sendJson(res, 429, 'rate_limit_error', 'Too many requests at once. Wait for the current one to finish.', { 'retry-after': '2' });
       return;
     }
+    // Already at the cap (counting what is in flight): refuse before reading a
+    // single body byte, so a capped-out key costs this process nothing.
+    if (Number.isFinite(cap) && guestUsage.tokensToday(name) + state.reserved >= cap) {
+      sendJson(res, 429, 'rate_limit_error',
+        `Daily limit reached (${cap.toLocaleString('en-US')} tokens). It resets at midnight UTC.`,
+        { 'retry-after': String(secondsToUtcMidnight()), connection: 'close' });
+      req.resume?.();
+      return;
+    }
     state.recent.push(now);
     state.inflight += 1;
     let reservation = 0;
@@ -627,6 +717,9 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
       }
       state.reserved += reservation;
       for (const h of STRIPPED_REQUEST_HEADERS) delete req.headers[h];
+      const beta = stripLongContextBetas(req.headers['anthropic-beta']);
+      if (beta === undefined) delete req.headers['anthropic-beta'];
+      else req.headers['anthropic-beta'] = beta;
       guardResponse(res, identifiers);
       guestUsage.recordRequest(name);
       // The body is already read; the forwarder reads it again from this copy.
@@ -657,6 +750,7 @@ export function createGuestRequestHandler({ accountManager, config, hooks = {}, 
           if (total > booked.input) { add += total - booked.input; booked.input = total; }
         }
         guestUsage.recordTokens(name, add);
+        persistNearCap(name, cap);
       };
       booked.forwarded = true;
       await forwarderFor(key)(replay, res);
